@@ -142,8 +142,9 @@ def test_memory_equivariance_comoving_on_lattice():
     assert out["comoving_off"]["t6"][0] >= 0
 
 
-def test_nodes_frozen_in_prediction_by_default():
-    """--node_update_pred off (default): nodes move during the observation and stay fixed while predicting."""
+def test_node_update_pred_flag():
+    """--node_update_pred off: nodes move during the observation and stay fixed while predicting;
+    on (default): they keep moving. The observation phase is identical."""
     torch.manual_seed(4)
     obs = torch.rand(1, 6, 1, 12, 12)
     a_in, a_out = torch.randn(1, 6, 2), torch.randn(1, 4, 2)
@@ -159,3 +160,4 @@ def test_nodes_frozen_in_prediction_by_default():
     assert (pred_off - pred_off[:1]).abs().max() < 1e-6                     # (state stored as a spatial mean)
     assert (trajs["off"][:6] - trajs["on"][:6]).abs().max() == 0           # same observation phase
     assert (trajs["on"][6:] - trajs["on"][5:6]).abs().max() > 1e-4
+    assert build_model(dict(model="adaptive", C=8, world=20, window=12)).node_update_pred   # default: on

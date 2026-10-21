@@ -55,7 +55,7 @@ class KineticWM(nn.Module):
                  bounce="rigid", rigid_K=28, rigid_eps=1e-3, rigid_eps_rel=0.05,
                  dec_input="flowm", beta_init=10.0, grad_ckpt=False,
                  n_digits=5, imprint_k=8, imprint_gamma=0.9,
-                 node_update_pred=False, readout_rel=True):
+                 node_update_pred=True, readout_rel=False):
         super().__init__()
         if kind not in MODELS:
             raise ValueError(f"model must be one of {MODELS}")
@@ -304,6 +304,6 @@ def build_model(args):
                      bounce=g("bounce", "rigid"), rigid_K=g("rigid_K", 28), rigid_eps=g("rigid_eps", 1e-3),
                      rigid_eps_rel=g("rigid_eps_rel", 0.05),
                      imprint_k=g("imprint_k", 8), imprint_gamma=g("imprint_gamma", 0.9),
-                     node_update_pred=(g("node_update_pred", "off") == "on"),
-                     readout_rel=(g("readout_rel", "on") == "on"),
+                     node_update_pred=(g("node_update_pred", "on") == "on"),
+                     readout_rel=(g("readout_rel", "off") == "on"),
                      grad_ckpt=g("grad_ckpt", False))

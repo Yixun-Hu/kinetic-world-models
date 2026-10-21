@@ -126,13 +126,14 @@ def get_parser():
     g.add_argument("--node_spacing", type=float, default=1.0, help="velocity lattice spacing (1.0: 25 nodes)")
     g.add_argument("--readout", default=None, choices=[None, "max", "moments"],
                    help="default: max for flowm, moments otherwise")
-    g.add_argument("--readout_rel", default="on", choices=["on", "off"],
-                   help="moment readout with observer-relative velocities v - a/dt (Galilean invariant)")
+    g.add_argument("--readout_rel", default="off", choices=["on", "off"],
+                   help="experimental (on): moment readout with observer-relative velocities v - a/dt "
+                        "(Galilean invariant); off: absolute node velocities, as in the reported results")
     g.add_argument("--imprint_k", type=int, default=8, help="adaptive: observation imprint channels per node")
     g.add_argument("--imprint_gamma", type=float, default=0.9, help="adaptive: imprint decay per step")
-    g.add_argument("--node_update_pred", default="off", choices=["on", "off"],
-                   help="adaptive: also update the nodes from the model's own predictions (on) or only from "
-                        "observations (off)")
+    g.add_argument("--node_update_pred", default="on", choices=["on", "off"],
+                   help="adaptive: update the nodes also from the model's own predictions (on, as in the "
+                        "reported results) or only from observations (off, experimental)")
     g.add_argument("--dec_input", default="flowm", choices=["flowm", "zero"],
                    help="prediction-phase input: the previous prediction (FloWM) or zeros")
     # walls (experimental)

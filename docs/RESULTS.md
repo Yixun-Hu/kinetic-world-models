@@ -2,8 +2,9 @@
 
 All models below have 32 hidden channels and 25 velocity nodes. Training
 uses batch size 16, 30 observed and 20 predicted frames, learning rate 1e-3
-unless noted, and one seed. Validation uses 300 held-out sequences, 50
-observed frames, and up to 150 predicted frames. The 95% confidence intervals
+unless noted, and one seed. Validation uses 300 held-out sequences, 30
+observed frames, and up to 150 predicted frames. Only the benchmark of the
+published weights in Section 1 uses 50 observed frames, as in the paper. The 95% confidence intervals
 are about 0.002 for the 20-frame errors. "Integer data" means integer digit
 velocities and integer camera motion, which is FloWM's setting. The three
 models are FloWM (its cell retrained on our data), the spectral model
@@ -35,8 +36,8 @@ velocity nodes to the true digit velocities.
 
 | Data | FloWM | Spectral | Oracle nodes |
 |---|---|---|---|
-| Integer data, 10k steps | 0.0098 | 0.0089 | |
-| Both real-valued, 10k steps, lr 3e-4 | 0.094 | 0.061 | 0.0063 |
+| Integer data, 10k steps, lr 1e-4 | 0.0098 | 0.0089 | |
+| Both real-valued, 10k steps, lr 3e-4 | 0.077 | 0.061 | 0.0061 |
 | Both real-valued, 60k steps, lr 3e-4 | 0.064 | 0.034 | |
 
 On integer data the two models are equal, so spectral transport costs
@@ -50,7 +51,7 @@ lattice.
 | Data | FloWM | Spectral | Adaptive |
 |---|---|---|---|
 | Real-valued camera motion only, 10k steps | 0.047 | 0.0028 | 0.0066 (2k steps) |
-| Real-valued velocities only, 10k steps | | 0.040 | 0.034 |
+| Real-valued velocities only, 10k steps | | 0.040 | 0.031 |
 
 Making the camera motion continuous accounts for a factor of seventeen by
 itself and brings the spectral model to the integer-data level, with SSIM 0.94
@@ -65,6 +66,7 @@ and is where the adaptive nodes act.
 | Spectral | 20k | 0.033 | 0.287 | 0.73 | 5.2e-3 |
 | Adaptive | 5k | 0.036 | 0.089 | 0.115 | 5.6e-4 |
 | Adaptive | 10k | 0.033 | 0.106 | 0.156 | 8.6e-4 |
+| Adaptive, best checkpoint by 20-frame error (19k) | 20k | 0.027 | 0.102 | | |
 | Oracle nodes | 10k | 0.006 | 0.043 | | |
 
 The spectral model matches the adaptive model at 20 frames but diverges over
@@ -77,7 +79,8 @@ for the first.
 
 At the end of the 30 observed frames, the median distance between a node and
 the true velocity of the digit it holds is 0.054 px/frame over 320 digits.
-For the fixed lattice the median distance to the nearest node is 0.51.
+For the fixed lattice the median distance from a digit's velocity to the
+nearest node is 0.40 over all 1500 validation digits.
 
 ![Velocity space](../results/figs/velocity_space.png)
 

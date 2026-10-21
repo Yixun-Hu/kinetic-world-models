@@ -21,8 +21,8 @@ their true positions while they are out of view.*
 ## What is in the box
 
 - An online 2D benchmark, Kinetic MNIST World. It follows FloWM's MNIST World
-  with a 50x50 world, a 32x32 viewport, 5 digits, 50 observed frames and up to
-  150 predicted frames. It adds switches for real-valued digit velocities,
+  with a 50x50 world, a 32x32 viewport, 5 digits, 30 or 50 observed frames
+  and up to 150 predicted frames. It adds switches for real-valued digit velocities,
   real-valued camera motion, reflecting walls, and fractional time steps.
 - A reimplementation of the 2D FloWM cell that matches the authors' code to
   within 1e-6, and a loader for their published checkpoint.
@@ -37,9 +37,10 @@ their true positions while they are out of view.*
 
 Mean squared error of the predicted viewport on 300 validation sequences with
 real-valued velocities and camera motion, averaged over the first 20 and over
-the first 150 predicted frames. All models have about 20k parameters, 32
-hidden channels and 25 velocity nodes, and are trained for at most 20k steps
-at batch size 16.
+the first 150 predicted frames. The models trained here have about 20k parameters, 32 hidden channels and
+25 velocity nodes, and are trained for at most 20k steps at batch size 16.
+The first row uses the authors' checkpoint, a 64-channel model trained on
+integer data.
 
 | Model | 20 frames | 150 frames |
 |---|---|---|
@@ -57,7 +58,7 @@ target for the adaptive nodes.
 Two more numbers say where the gain comes from. With real-valued camera motion
 and integer object velocities, spectral transport alone reaches 0.0028 against
 0.047 for FloWM. With integer camera motion and real-valued object velocities,
-the fixed velocity lattice reaches 0.040 and the adaptive nodes 0.034 after
+the fixed velocity lattice reaches 0.040 and the adaptive nodes 0.031 after
 10k steps, and the gap grows with the horizon.
 
 ![Rollout](results/figs/rollout.gif)
@@ -70,8 +71,8 @@ prediction of the retrained FloWM.*
 
 *Left: during the 30 observed frames, each adaptive node (line) moves from its
 lattice point to the true velocity of the digit it holds (cross). Right: the
-fixed lattice of FloWM, where the nearest node is 0.5 pixel per frame away on
-average.*
+fixed lattice of FloWM, where the nearest node is 0.4 pixel per frame away
+from a digit's velocity on average.*
 
 ## Quick start
 

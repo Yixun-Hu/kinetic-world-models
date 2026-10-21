@@ -34,9 +34,8 @@ Training writes `best.pt` (best validation MSE over 20 predicted frames), `best1
 and `last.pt`; `--keep_ckpts` also keeps `ckpt_step<N>.pt` every `--ckpt_every` steps. `kwm.eval --ckpt`
 takes any of these names.
 
-Two defaults differ from the runs behind RESULTS.md, which used `--readout_rel off` (readout on absolute node
-velocities) and, for the adaptive model, `--node_update_pred on` (nodes also updated from the model's own
-predictions). Add these two flags to reproduce the tables exactly.
+The defaults are the configuration behind RESULTS.md. `--readout_rel on` (observer-relative readout) and
+`--node_update_pred off` (adaptive nodes frozen while predicting) are experimental and not used there.
 
 To run several commands one after another on one GPU, put them in a text file, one per line, and use
 
@@ -99,9 +98,8 @@ The oracle run is the one from Section 2.
 
 ```bash
 python -m kwm.train --model flowm    --real_velocity --real_camera --out runs/flowm
-python -m kwm.train --model spectral --real_velocity --real_camera --readout_rel off --out runs/spectral
-python -m kwm.train --model adaptive --real_velocity --real_camera --readout_rel off --node_update_pred on \
-    --keep_ckpts --out runs/adaptive
+python -m kwm.train --model spectral --real_velocity --real_camera --out runs/spectral
+python -m kwm.train --model adaptive --real_velocity --real_camera --keep_ckpts --out runs/adaptive
 python -m kwm.eval --run runs/flowm    --equiv_boost
 python -m kwm.eval --run runs/spectral --ckpt last --equiv_boost
 python -m kwm.eval --run runs/adaptive --ckpt ckpt_step5000  --equiv_boost --tag step5000
