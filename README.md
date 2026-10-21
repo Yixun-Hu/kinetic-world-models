@@ -72,7 +72,7 @@ prediction of the retrained FloWM.*
 *Left: during the 30 observed frames, each adaptive node (line) moves from its
 lattice point to the true velocity of the digit it holds (cross). Right: the
 fixed lattice of FloWM, where the nearest node is 0.4 pixel per frame away
-from a digit's velocity on average.*
+from a digit's velocity in the median.*
 
 ## Quick start
 

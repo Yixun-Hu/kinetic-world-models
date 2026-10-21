@@ -37,8 +37,10 @@ velocity nodes to the true digit velocities.
 | Data | FloWM | Spectral | Oracle nodes |
 |---|---|---|---|
 | Integer data, 10k steps, lr 1e-4 | 0.0098 | 0.0089 | |
-| Both real-valued, 10k steps, lr 3e-4 | 0.077 | 0.061 | 0.0061 |
+| Both real-valued, 10k steps, lr 3e-4 | 0.077* | 0.061 | 0.0061 |
 | Both real-valued, 60k steps, lr 3e-4 | 0.064 | 0.034 | |
+
+\* Validation error at step 10k of the 60k-step run.
 
 On integer data the two models are equal, so spectral transport costs
 nothing. On real-valued data FloWM reaches a plateau at 20k steps that more
@@ -63,10 +65,10 @@ and is where the adaptive nodes act.
 | Model | Steps | 20 frames | 150 frames | Error at frame 150 | Slope over 150 frames |
 |---|---|---|---|---|---|
 | FloWM | 20k | 0.067 | 0.145 | 0.31 | 1.3e-3 |
-| Spectral | 20k | 0.033 | 0.287 | 0.73 | 5.2e-3 |
+| Spectral | 20k | 0.033 | 0.287 | 0.72 | 5.2e-3 |
 | Adaptive | 5k | 0.036 | 0.089 | 0.115 | 5.6e-4 |
 | Adaptive | 10k | 0.033 | 0.106 | 0.156 | 8.6e-4 |
-| Adaptive, best checkpoint by 20-frame error (19k) | 20k | 0.027 | 0.102 | | |
+| Adaptive, best checkpoint (20k) | 20k | 0.027 | 0.089 | 0.124 | 7.1e-4 |
 | Oracle nodes | 10k | 0.006 | 0.043 | | |
 
 The spectral model matches the adaptive model at 20 frames but diverges over
