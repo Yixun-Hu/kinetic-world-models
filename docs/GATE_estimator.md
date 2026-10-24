@@ -1,207 +1,336 @@
 # No-learning estimator gate
 
-**Gate passed. Recommend `D_lock_LK_2mode` for the next node-update PR:**
-local search at lag 1 when unlocked, LK when locked, and two-mode pooling of
-whichever displacement field is active. Use the settings below unchanged:
-agreement threshold 0.1, lock residual norm 0.3, step clip 0.3, offset bound
-0.75, residual-size gate 0.6, minimum mode mass 10%, and minimum mode separation
-0.1 px/frame. Keep per-sample snapshots and `s=1`; no learned estimator weights
-are needed.
+**Recommend the heavier-mode D2 rule with the ±1.0-pixel grid as the candidate
+for integration**, subject to the numerical acceptance issue below. On three
+100-sequence datasets, pooled matched error is **0.0238 px/frame** and
+miss rate **18.4%**, versus A_LK's **0.0818 / 42.1%**.
+The ±1.5 heavier variant is the accuracy winner (**0.0231 / 18.3%**).
+Reducing the grid from 49 to 25 candidates costs two misses among 1,500 digits,
+while making estimator inference **1.50× faster** on the measured CPU.
+Retain ±1.5 as the accuracy comparison in the integration PR.
 
-On **all 300 sequences**, matched median error falls from **0.0821 to 0.0294
-px/frame**, an absolute reduction of 0.0527 (**64.2%**). Closest-node median falls
-from 0.0816 to 0.0293. Matched errors above 0.1 fall from **42.4% to 25.2%**
-(**17.2 percentage points**, 258 fewer misses among 1,500 digits). Same-cell
-pairs resolved by distinct nodes rise from **28/133 to 41/133** (21.1% to 30.8%).
-A paired, sequence-level bootstrap with 2,000 resamples gives descriptive 95%
-intervals of **0.0480–0.0587 px/frame** for the median reduction and
-**14.3–19.9 percentage points** for the miss-rate reduction. These intervals
-are not adjusted for selecting among estimators.
+The implementation now evaluates dense local search for every node, selects LK
+or search with `torch.where`, and computes SSD as `|m|² + |c|² - 2 m·c` by a
+channel contraction. It never allocates the node × candidate × channel
+image-difference tensor. Search construction and evaluation run under
+`torch.no_grad()` with autocast disabled; displacements are fp32. Lock diagnostics
+stay as tensors throughout the step loop. The boundary fix applies to every
+B/C/D search, including the smaller grid.
 
-The tradeoffs are real: median first lock is step **6 versus 5**, although
-never-locked digits fall from 23.3% to 20.1%. CPU time is **2.646 s/step at
-batch 16**, about **4.5×** the equally snapshot-based LK control (0.584 s).
-The original LK row includes snapshot replay overhead, as explained below.
-Same-cell separation remains incomplete: even the winner's own-cell primary
-and secondary modes resolve only **21/133 pairs (15.8%)**. This gate establishes
-no-learning node accuracy; end-to-end forecasting and CUDA throughput remain
-unmeasured.
+**Numerical acceptance remains open.** Against the saved pre-revision D2 on the
+first 20 sequences of the original seed-2024 dataset, all 30 steps and all 25
+nodes were checked. Maximum absolute component difference is **6.9975853e-5**;
+final-step maximum is **3.0755997e-5**. This does **not** meet the requested
+`<1e-5` tolerance. Dense routing with the old SSD arithmetic was exactly equal
+on the first four sequences; the difference is in the norm/dot arithmetic.
+Neither fp64 accumulation nor centering consistently fixed it, so those
+experimental changes were discarded. The delivered `--parity-reference`
+check records the maximum and exits unsuccessfully when the tolerance fails.
+Accuracy results below use the delivered fp32 norm/dot implementation; they
+are not a claim of numerical parity or readiness to merge a production PR.
 
-Two-mode B is the runner-up (0.0492 median, 28.8% misses). Plain D also beats LK
-(0.0677, 34.8%); plain B's gain is smaller (0.0765, 40.3%). C's two-mode variants
-beat LK's median but have more misses and substantially higher cost than
-the winner. Adding lag 8 raises their miss rate from 31.9% to 36.6%. Removing
-LK's step clip does not help. The window-level correlation controls remain
-poor (76–91% misses). Snapshot-only LK is slightly worse than original LK,
-so changing image storage alone does not explain the winner's improvement.
+## Protocol and metrics
 
-Every estimator shares an identical frozen, randomly initialized
-`AdaptiveNodeCell(C=32, num_v=25)` imprint (`K=8`, initialization seed 0, fixed
-projection, `s=1`). There is no training or access to digit labels in any
-estimator other than the explicitly labelled oracle.
+All rows use the same frozen, randomly initialized
+`AdaptiveNodeCell(C=32, num_v=25)`, eight imprint channels, initialization seed
+0, fixed projection and `s=1`. Estimators see only images and exact camera
+actions. Labels are used only for metrics. There is no learning, CUDA use,
+autocast or TF32 in the accuracy runs.
 
-The dataset is one CPU `make_batch(300, 30, 0,
-EnvConfig(real_velocity=True, real_camera=True), split='test',
-gen=torch.Generator().manual_seed(2024))` call. It contains five digits per
-sequence, no walls, exact camera actions, and real velocities in `[-2,2]^2`.
-Generating once before splitting into processing batches makes the sequences
-independent of estimator selection and batch size. All arithmetic is fp32
-(FFT coefficients are complex64); autocast and TF32 are off. No GPU was available
-in the execution environment, so reported measurements are CPU measurements.
-All 1,500 digits pass the final-ten-frame visibility filter. There are 133
-same-cell pairs in 124/300 sequences (41.3%). A separate binary Hungarian
-reachability check finds 9/1,500 digits (0.6%) cannot simultaneously receive
-distinct nodes under the ±0.75 bound, in nine sequences. This is a geometric
-ceiling, independent of image-based estimation.
+There are three datasets of 100 sequences and 30 observed frames, each with
+five digits: seed **2024 uses indices 0–99 of the original single 300-sequence
+generation call**; seeds **777** and **31337** each use one 100-sequence call.
+All use CPU `make_batch(..., EnvConfig(real_velocity=True, real_camera=True),
+split='test')`. Generating a new batch of 100 at seed 2024 would give different
+sequences. Processing batches contain two sequences and do not affect the
+input dataset. All 1,500 digits pass the visibility filter. Same-cell pair
+counts are **45 / 60 / 68**, in **39 / 53 / 49** sequences, respectively.
 
-estimator | n | closest | matched | >.1 | lock* | never | pair | 2mode | s/step@16
---- | --- | --- | --- | --- | --- | --- | --- | --- | ---
-fixed_lattice | 300 | 0.4061 | 0.4183 | 97.1% | 30 | 97.1% | 0.0% | — | —
-oracle_25 | 300 | 0.0000 | 0.0000 | 0.0% | 0 | 0.0% | 100.0% | — | —
-A_LK | 300 | 0.0816 | 0.0821 | 42.4% | 5 | 23.3% | 21.1% | — | 1.5769
-A_LK_no_clip | 300 | 0.0823 | 0.0829 | 42.6% | 5 | 23.0% | 21.1% | — | 1.4942
-A_LK_snapshot | 300 | 0.0863 | 0.0868 | 44.3% | 5 | 23.3% | 23.3% | — | 0.5839
-B_local | 300 | 0.0764 | 0.0765 | 40.3% | 5 | 20.5% | 18.8% | — | 2.2772
-B_local_2mode | 300 | 0.0491 | 0.0492 | 28.8% | 6 | 20.9% | 26.3% | 9.0% | 2.4706
-C_lags124 | 300 | 0.0768 | 0.0768 | 43.4% | 5 | 28.2% | 14.3% | — | 6.3416
-C_lags124_2mode | 300 | 0.0428 | 0.0434 | 31.9% | 5 | 26.4% | 27.1% | 7.5% | 6.2288
-C_lags1248 | 300 | 0.0765 | 0.0768 | 44.6% | 5 | 33.1% | 15.8% | — | 7.5523
-C_lags1248_2mode | 300 | 0.0408 | 0.0417 | 36.6% | 5 | 31.5% | 21.8% | 4.5% | 7.4590
-D_lock_LK | 300 | 0.0677 | 0.0677 | 34.8% | 5 | 17.8% | 24.1% | — | 2.8180
-D_lock_LK_2mode | 300 | 0.0293 | 0.0294 | 25.2% | 6 | 20.1% | 30.8% | 15.8% | 2.6461
-E_window_nearest124 | 300 | 0.1795 | 0.1805 | 76.1% | 16 | 40.7% | 3.8% | — | 0.5253
-E_window_strongest124 | 300 | 0.1912 | 0.1929 | 77.9% | 16 | 40.3% | 3.0% | — | 0.4318
-E_window_nearest1 | 300 | 0.2909 | 0.2935 | 90.6% | 30 | 71.5% | 2.3% | — | 0.1647
+Errors are Euclidean px/frame. `closest` is the nearest-node median. `matched`
+is the median after Hungarian assignment on all five digits, followed by
+filtering to digits visible at least once in the last ten frames. `miss` is
+the matched fraction above 0.1. `lock` is the median first visible step with a
+node within 0.1, zero-based and censored at 30; `never` is that censoring
+fraction. A first hit need not persist. All medians use the lower middle value,
+as `torch.median` does.
 
-Errors are Euclidean px/frame. `closest` and `matched` are medians across digits
-visible at least once in frames 20–29. Matching uses SciPy's Hungarian assignment
-on **all five digits**, then filters visibility, exactly as `pr1_sim.py` does.
-`>.1` is the fraction of those digits whose matched error exceeds 0.1.
-`lock*` is the median first **visible** step at which any node is within 0.1 of
-that digit, with zero-based steps 0–29 and never-locked digits censored to 30.
-`never` reports that censoring fraction. Locking is a first hit, not a guarantee
-that the node stays locked or that every digit has a distinct node at that step.
+`pair` is the fraction of same-lattice-cell digit pairs resolved within 0.1 by
+two distinct Hungarian-assigned nodes. `2mode` is the stricter diagnostic in
+which that original cell's actual node and its secondary mode must match both
+digits. Secondary modes never become extra nodes in the main metrics. A dash
+means not applicable. All percentages in the tables are percentages, not
+fractions.
 
-`pair` counts final same-Voronoi-cell digit pairs for which **both distinct
-Hungarian-assigned nodes** have error at most 0.1. Both digits must satisfy the
-same visibility filter. `2mode` is a separate, stricter local diagnostic: can
-the original lattice cell's actual node and its reported secondary mode match
-both digits, in either order, within 0.1? Secondary modes never become extra
-nodes in the main error or pair metrics. JSON includes their velocities and
-validity masks. A dash means not applicable (or no qualifying pairs).
+`B2` means `B_local_2mode`; `D2` means `D_lock_LK_2mode`. `C124`/`C1248` use
+lags `(1,2,4)`/`(1,2,4,8)`. `plain` means one pooled mode. `nearest` is the
+original rule; `heavier` chooses the mode with larger pooled mass (left wins
+an exact mass tie). The other mode is secondary. All searches use a 0.5-pixel
+spacing. The default radius is ±1.5 pixels; `grid1` means ±1.0 pixels.
 
-The `s/step@16` column is the median of three timed steps, frames 9–11, following
-nine warmup frames at batch 16 on the same dataset. It includes observation
-encoding, snapshot handling, transport, search and the node update; it excludes
-data generation, transfers, metrics and the unrelated recurrent feature
-convolution. Fixed/oracle references have no timed update. These are wall-clock
-measurements on a shared CPU host, not GPU throughput estimates.
+## Three-seed accuracy
 
-The estimators use the following fixed settings:
+Seed 2024, original first 100:
 
-- **A, LK:** original `lk_displacement`, damping, texture gate, displacement
-  gate 0.6, agreement gate, evidence running mean, componentwise step clip 0.3,
-  and componentwise lattice-offset bound 0.75. `A_LK_no_clip` removes only the
-  step clip. To respect the prohibition on a persistent per-node imprint bank,
-  A reconstructs the original overwrite/0.9-decay imprint recurrence from
-  per-sample snapshots and past node velocities. Sequential spectral shifts
-  are replayed exactly, including overwrite masks and Nyquist effects. Replay
-  is included in A's timing; that timing is **not** a claim about the cost of
-  the production cell with its existing cached imprint.
-- **A snapshot control:** identical LK weighting and update, but uses only the
-  immediately previous snapshot and its overlap support. This separates changes
-  in the displacement estimator from changes in observation memory.
-- **B, local SSD:** transport the previous snapshot by `nu - camera_action`;
-  compare each transported pixel with the new imprint at 49 residual offsets
-  in `[-1.5,1.5]^2`, spaced by 0.5 px. Fractional candidates use the repository's
-  spectral shift. SSD sums the eight imprint channels, then uses a separable
-  Gaussian with sigma 2, radius 6, normalized by observed overlap. A per-pixel
-  minimum gets axis-wise three-point parabolic refinement. Pool using KWM's
-  imprint mass, texture threshold, residual-size gate and **unshifted**
-  agreement gate, then use the same running mean, clip and bound as A.
-  Overlap masks use bilinear periodic sampling to avoid Fourier mask ringing.
-- **C, multi-lag SSD:** B at lags `(1,2,4)` or `(1,2,4,8)`. For lag `L`, transport
-  the old snapshot by `nu*L - (camera_t-camera_{t-L})`; the velocity measurement
-  is `nu + pooled_residual/L`. Search radius stays 1.5 **pixels**, not 1.5
-  px/frame. Fit constant velocity using displacement least squares (weights
-  proportional to evidence times `L²`) and two Cauchy reweightings with velocity
-  scale 0.15, as in `fit_motion`. Accumulate the summed lag evidence in KWM's
-  running mean. The size gate is applied to residual velocity. All lagged images
-  are shared per-sample snapshots; transported node images are temporary.
-- **D, lock then refine:** compute snapshot LK and its evidence first. A node
-  is locked when coherence-weighted evidence / textured imprint mass is at
-  least 0.1 and pooled LK residual norm is at most 0.3. Use LK there and local
-  SSD only at unlocked nodes; re-evaluate the condition every frame so nodes
-  can unlock. Keep A's running mean, clip and bound.
-- **Two-mode B/C/D variants:** weighted k=2 along the displacement covariance's
-  principal axis, five iterations, restricted to velocities within the node's
-  reachable lattice box (±0.75 per component). Accept a split only if each mode
-  has at least 10% of the weight and their separation is at least 0.1 px/frame.
-  Choose the mode nearest the current node velocity; independently accumulate
-  the second mode as a diagnostic, without feeding it back. C robustly fits
-  each selected mode across lags. D clusters the active displacement field:
-  LK at locked nodes and local SSD at unlocked nodes, with the same primary
-  mode selection and secondary-mode report in both cases.
-- **E, literal window correlation:** masked normalized FFT correlation on the
-  50×50 world, local-maximum candidates in the lattice node's reachable box,
-  nearest peak among those with at least 60% of the largest score, three-step
-  Newton refinement with the source's acceptance checks, robust lag fit, and
-  evidence running mean with bound 0.75 and no step clip. Also report the
-  source harness's strongest-peak and single-lag controls. Helpers are copied
-  with attribution; the delivered script does not import another repository.
-- **Fixed/oracle:** the 25-node integer lattice is the floor. The diagnostic
-  oracle has exactly five true digit velocities plus the first 20 vx-major
-  lattice velocities. It is an information reference, not a feasible bounded
-  update or a claim that all five velocities can always get distinct lattice
-  cells.
+variant / rule | closest | matched | miss | lock | never | pair | 2mode
+--- | --- | --- | --- | --- | --- | --- | ---
+A_LK | 0.0774 | 0.0781 | 40.6% | 5 | 21.2% | 17.8% | —
+B2 / nearest | 0.0479 | 0.0479 | 27.6% | 6 | 18.8% | 26.7% | 8.9%
+B2 / heavier | 0.0419 | 0.0425 | 23.4% | 5 | 14.6% | 31.1% | 8.9%
+C124 / plain | 0.0476 | 0.0485 | 30.2% | 5 | 19.4% | 17.8% | —
+C124 / nearest | 0.0374 | 0.0374 | 28.0% | 5 | 22.4% | 37.8% | 4.4%
+C124 / heavier | 0.0251 | 0.0251 | 20.0% | 4 | 14.2% | 31.1% | 2.2%
+C1248 / plain | 0.0417 | 0.0424 | 30.4% | 5 | 23.8% | 22.2% | —
+C1248 / nearest | 0.0359 | 0.0359 | 30.2% | 5 | 26.2% | 33.3% | 2.2%
+C1248 / heavier | 0.0241 | 0.0241 | 23.4% | 4 | 18.6% | 28.9% | 2.2%
+D2 / nearest | 0.0263 | 0.0263 | 22.8% | 6 | 18.8% | 33.3% | 15.6%
+D2 / heavier | 0.0215 | 0.0215 | 18.0% | 4 | 11.6% | 31.1% | 6.7%
+D2 grid1 / nearest | 0.0266 | 0.0266 | 25.6% | 6 | 21.6% | 28.9% | 15.6%
+D2 grid1 / heavier | 0.0228 | 0.0228 | 18.8% | 4 | 11.6% | 33.3% | 6.7%
 
-Run the full gate from the repository root:
+Seed 777, 100 sequences:
+
+variant / rule | closest | matched | miss | lock | never | pair | 2mode
+--- | --- | --- | --- | --- | --- | --- | ---
+A_LK | 0.0891 | 0.0910 | 44.8% | 5 | 25.0% | 18.3% | —
+B2 / nearest | 0.0532 | 0.0540 | 30.8% | 7 | 23.2% | 28.3% | 11.7%
+B2 / heavier | 0.0492 | 0.0504 | 27.8% | 5 | 17.4% | 28.3% | 5.0%
+C124 / plain | 0.0559 | 0.0559 | 30.6% | 4 | 21.2% | 28.3% | —
+C124 / nearest | 0.0385 | 0.0390 | 25.8% | 5 | 20.8% | 28.3% | 10.0%
+C124 / heavier | 0.0316 | 0.0321 | 21.6% | 4 | 15.6% | 30.0% | 6.7%
+C1248 / plain | 0.0448 | 0.0448 | 31.2% | 4 | 25.2% | 30.0% | —
+C1248 / nearest | 0.0350 | 0.0355 | 29.8% | 5 | 25.0% | 33.3% | 8.3%
+C1248 / heavier | 0.0256 | 0.0258 | 21.2% | 4 | 17.6% | 38.3% | 6.7%
+D2 / nearest | 0.0353 | 0.0358 | 25.4% | 6 | 21.8% | 33.3% | 10.0%
+D2 / heavier | 0.0245 | 0.0245 | 19.4% | 4 | 11.4% | 28.3% | 5.0%
+D2 grid1 / nearest | 0.0385 | 0.0386 | 28.6% | 7 | 23.2% | 30.0% | 10.0%
+D2 grid1 / heavier | 0.0241 | 0.0241 | 20.0% | 3 | 11.8% | 28.3% | 5.0%
+
+Seed 31337, third fresh set of 100 sequences:
+
+variant / rule | closest | matched | miss | lock | never | pair | 2mode
+--- | --- | --- | --- | --- | --- | --- | ---
+A_LK | 0.0769 | 0.0799 | 41.0% | 5 | 20.6% | 17.6% | —
+B2 / nearest | 0.0485 | 0.0488 | 27.8% | 7 | 22.0% | 38.2% | 8.8%
+B2 / heavier | 0.0427 | 0.0434 | 25.8% | 4 | 14.6% | 26.5% | 4.4%
+C124 / plain | 0.0525 | 0.0540 | 32.8% | 4 | 19.8% | 16.2% | —
+C124 / nearest | 0.0344 | 0.0346 | 27.4% | 5 | 23.0% | 26.5% | 10.3%
+C124 / heavier | 0.0293 | 0.0293 | 23.2% | 3 | 15.2% | 27.9% | 7.4%
+C1248 / plain | 0.0460 | 0.0473 | 31.4% | 4 | 23.0% | 20.6% | —
+C1248 / nearest | 0.0316 | 0.0319 | 31.6% | 5 | 26.6% | 20.6% | 8.8%
+C1248 / heavier | 0.0233 | 0.0241 | 23.8% | 3 | 18.0% | 26.5% | 5.9%
+D2 / nearest | 0.0308 | 0.0317 | 26.6% | 6 | 20.8% | 29.4% | 13.2%
+D2 / heavier | 0.0231 | 0.0233 | 17.4% | 3 | 8.4% | 39.7% | 4.4%
+D2 grid1 / nearest | 0.0297 | 0.0301 | 27.2% | 7 | 21.0% | 33.8% | 14.7%
+D2 grid1 / heavier | 0.0236 | 0.0242 | 16.4% | 4 | 7.8% | 44.1% | 4.4%
+
+Heavier beats nearest in both matched median and miss rate for B and D on
+every seed. For D on the third seed alone, ±1.5 heavier gives **0.0233 / 17.4%**,
+nearest gives **0.0317 / 26.6%**, and A_LK gives **0.0799 / 41.0%**.
+
+Pooled D2 results show the grid tradeoff:
+
+rule / grid | closest | matched | miss | lock | never | pair | 2mode
+--- | --- | --- | --- | --- | --- | --- | ---
+nearest / ±1.5 | 0.0308 | 0.0311 | 24.9% | 6 | 20.5% | 31.8% | 12.7%
+heavier / ±1.5 | 0.0229 | 0.0231 | 18.3% | 4 | 10.5% | 33.5% | 5.2%
+nearest / ±1.0 | 0.0311 | 0.0314 | 27.1% | 7 | 21.9% | 31.2% | 13.3%
+heavier / ±1.0 | 0.0235 | 0.0238 | 18.4% | 4 | 10.4% | 35.8% | 5.2%
+
+The smaller grid is competitive with the heavier rule; its nearest-rule miss
+rate is worse. Heavier improves primary-node recovery but reduces the stricter
+secondary-mode diagnostic. The speed/accuracy tradeoff motivates ±1.0; ±1.5
+remains the measured accuracy reference. No equivalence margin was tested.
+
+## Corrected multi-lag conclusion
+
+An edge minimum has no two-sided parabolic refinement. Previously, a clamped
+1.5-pixel displacement could pass the 0.6-pixel/frame size gate at lag 4 or 8
+and become a spurious velocity measurement. `usable` now requires both
+candidate coordinates to be strictly inside the grid, in addition to valid
+cost and overlap. This rule also applies to B and D, where the lag-1 size gate
+already excluded ±1.5-pixel minima.
+
+The old numerical comparison is withdrawn because it included boundary-clamped
+pseudo-measurements. The corrected results still show a pooled miss-rate
+increase from lag 8 for both two-mode rules: **27.1% → 30.5%** for nearest and
+**21.6% → 22.8%** for heavier. However, median error improves for every rule,
+plain C's miss rate slightly falls, and heavier C's misses fall on seed 777
+(21.6% → 21.2%). Thus the blanket claim that lag 8 raises misses is retracted;
+the qualified two-mode pooled tradeoff remains supported. D2 heavier retains
+the best pooled matched median and miss rate.
+
+All six C variants were rerun on all three datasets. Pooled over 300 sequences:
+
+rule | C124 matched / miss | C1248 matched / miss
+--- | --- | ---
+plain | 0.0537 / 31.2% | 0.0447 / 31.0%
+nearest | 0.0378 / 27.1% | 0.0345 / 30.5%
+heavier | 0.0290 / 21.6% | 0.0244 / 22.8%
+
+## Paired three-seed intervals
+
+comparison against A_LK | median reduction (95% CI), px/frame | miss reduction (95% CI), percentage points
+--- | --- | ---
+D2 heavier / ±1.5 (best accuracy) | 0.0587 (0.0528–0.0660) | 23.87 (21.27–26.53)
+D2 heavier / ±1.0 (recommended grid) | 0.0580 (0.0522–0.0652) | 23.73 (21.07–26.47)
+
+The paired bootstrap resamples whole sequences from the pooled 300 sequences,
+with 2,000 replicates and RNG seed 2024. Estimator and A_LK errors use the same
+indices and visibility masks. Intervals are descriptive 95% percentile
+intervals, unadjusted for choosing among variants. Dataset medians were not
+averaged.
+
+## CPU cost
+
+CPU operation, batch 16 | seconds/step
+--- | ---
+Production AdaptiveNodeCell inference | 1.6550
+Snapshot-LK estimator only | 0.4096
+D2 nearest / ±1.5, estimator only | 1.6832
+D2 heavier / ±1.5, estimator only | 1.6773
+D2 nearest / ±1.0, estimator only | 1.1341
+D2 heavier / ±1.0, estimator only | 1.1165
+
+Timing uses batch 16, one PyTorch/OpenBLAS/OMP thread, nine warmup steps and
+11 measured steps (frames 9–19); each entry is their median wall-clock time.
+The production row measures the complete existing `AdaptiveNodeCell` inference
+step, including encoding, feature transport/mixing and imprint/state updates.
+Estimator rows start with preencoded imprints and include snapshot handling,
+transport, displacement estimation, mode pooling and node updates, but exclude
+encoding and the feature recurrence. They are not whole-model or training
+step times, and adding one to the production row would double-count existing
+estimator work. Timing runs are sequential after the accuracy jobs finish.
+Hardware: Intel Xeon Gold 5220R, 2.20 GHz; PyTorch 2.9.0+cu128. No GPU timings
+were attempted because the GPU was reserved.
+
+## Prediction-phase proxy
+
+estimator | inputs at measurement | closest | matched | miss
+--- | --- | --- | --- | ---
+A_LK | 30 true frames | 0.0797 | 0.0797 | 40.0%
+A_LK | 50 true frames (control) | 0.0735 | 0.0735 | 40.0%
+A_LK | 30 true + 20 predicted | 0.0947 | 0.0947 | 48.0%
+D2 heavier / ±1.5 | 30 true frames | 0.0265 | 0.0265 | 17.5%
+D2 heavier / ±1.5 | 50 true frames (control) | 0.0221 | 0.0221 | 14.5%
+D2 heavier / ±1.5 | 30 true + 20 predicted | 0.0369 | 0.0369 | 21.0%
+D2 heavier / ±1.0 | 30 true frames | 0.0260 | 0.0260 | 18.0%
+D2 heavier / ±1.0 | 50 true frames (control) | 0.0228 | 0.0229 | 15.0%
+D2 heavier / ±1.0 | 30 true + 20 predicted | 0.0377 | 0.0377 | 21.0%
+
+The proxy uses 40 sequences from generator seed 778 with 30 observed and 20
+future frames. The generator model is loaded on CPU with
+`kwm.model.build_model(checkpoint['args'])`, then its saved weights, from
+`adaptive_bs16_ckpt/best.pt` in the supplied 200-step benchmark directory.
+`node_update_pred=True` is explicit. All gate variants retain the frozen
+seed-0 imprint and update nodes on all 50 inputs. They receive the same 20
+self-predictions from that checkpoint; D does not change the generator's
+predictions. A 50-true-frame control uses the same sequences and actions.
+The visibility filter for the 50-step result uses frames 40–49.
+
+The shared prediction MSE is **0.119518**, versus true-frame
+mean squared intensity **0.154766**. Checkpoint SHA-256:
+`b1156def12dd0a3f1664f0aaeb38b5cbf6cc3abfda2ef6629bc054fa007fef03`.
+
+This measures sensitivity to predicted inputs, not the forecast quality of a
+D-integrated model. End-to-end retraining and comparisons with prediction-phase
+node updates on/off remain unmeasured.
+
+## Estimator settings
+
+- A replays the production LK overwrite/0.9-decay imprint from per-sample
+  snapshots and past velocities, including sequential spectral shifts and
+  Nyquist effects. The snapshot-LK cost control uses only the preceding
+  snapshot. Replay cost is not the production cell cost.
+- B transports a snapshot by `nu - camera_action`, searches shared spectral
+  shifts of the current imprint, and aggregates SSD with a separable Gaussian
+  (sigma 2, radius 6), normalized by observed overlap. Masks use bilinear
+  periodic sampling. Interior minima receive axis-wise parabolic refinement.
+- C transports lag-L snapshots by `nu*L - camera_delta`. The search radius is
+  in pixels, not pixels/frame. Divide the residual by L, then fit velocity by
+  displacement WLS with weights `evidence*L²` and two Cauchy reweightings
+  (scale 0.15). Snapshots are per sample, never persistent per-node images.
+- D computes snapshot LK first. A node is locked when evidence/textured mass
+  is at least 0.1 and pooled LK residual norm is at most 0.3. Dense search is
+  evaluated for all nodes, then `torch.where` selects LK at locked nodes and
+  search at unlocked nodes. Locking is reevaluated every step.
+- Two-mode variants restrict candidate velocities to the node's reachable
+  lattice box, cluster along the displacement covariance's principal axis
+  for five iterations, and accept a split only with at least 10% mass in each
+  mode and separation at least 0.1 px/frame. D clusters the selected field,
+  including LK at locked nodes. C robustly fits selected primary and secondary
+  modes across lags. Secondary evidence is accumulated only diagnostically.
+- All use the original mass, texture, residual-velocity size gate 0.6 and
+  unwarped agreement weighting, evidence running mean, componentwise step
+  clip 0.3 and lattice-offset bound 0.75. No learned estimator parameters were
+  added. The old window-correlation controls remain available but were not
+  part of this revision's rerun matrix.
+
+## PR requirements
+
+- Keep search under `torch.no_grad()`.
+- Carry velocities, accumulated evidence and snapshots in the recurrent state
+  in fp32, not mutable Python attributes. This standalone inference harness
+  still owns its state; it is not a checkpoint-safe production cell interface.
+- Maintain an fp32 island under bf16 autocast for transport/estimation,
+  velocities, evidence and snapshot updates.
+- Avoid host synchronizations inside steps: no `.item()`, `.tolist()`, Python
+  conversions of device scalars, or data-dependent `nonzero` routing.
+- Only locked nodes carry a displacement gradient through LK; the searched
+  displacement is detached. The learned scale `s` must still train on both
+  paths. Keep weighting/selection decisions outside the displacement gradient.
+
+Resolve the numerical-parity failure above before claiming the requested
+implementation acceptance. Measure GPU step time when the reserved GPU is
+available and validate an end-to-end trained integration, including
+prediction-phase updates on/off; this CPU estimator gate does not supply
+those results.
+
+## Reproduction and artifacts
+
+Use `/home/yixunhu/miniconda3/envs/flowm/bin/python` with
+`CUDA_VISIBLE_DEVICES='' OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1`. The script
+hides CUDA by default and never overwrites an explicit visibility setting.
+Only `scripts/estimator_gate.py` and `docs/GATE_estimator.md` were changed;
+`kwm/`, `tests/` and the pre-existing `results/gate_estimator.json` were left
+untouched. No commit was created.
+
+Accuracy runs (one output per dataset):
 
 ```bash
-OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 \
-  /home/yixunhu/miniconda3/envs/flowm/bin/python scripts/estimator_gate.py \
-  --n 300 --device cpu --estimators A,B,C,D,E \
-  --out results/gate_estimator.json
+export CUDA_VISIBLE_DEVICES='' OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
+PY=/home/yixunhu/miniconda3/envs/flowm/bin/python
+VARIANTS=A_LK,B_local_2mode,B_local_2mode_heavier,C,D_lock_LK_2mode,D_lock_LK_2mode_heavier,D_lock_LK_2mode_grid1,D_lock_LK_2mode_grid1_heavier
+"$PY" scripts/estimator_gate.py --n 100 --dataset-size 300 --seed 2024 --batch-size 2 --estimators "$VARIANTS" --skip-benchmark --out /tmp/gate2024.json
+"$PY" scripts/estimator_gate.py --n 100 --seed 777 --batch-size 2 --estimators "$VARIANTS" --skip-benchmark --out /tmp/gate777.json
+"$PY" scripts/estimator_gate.py --n 100 --seed 31337 --batch-size 2 --estimators "$VARIANTS" --skip-benchmark --out /tmp/gate31337.json
+"$PY" scripts/estimator_gate.py --pool-results /tmp/gate2024.json /tmp/gate777.json /tmp/gate31337.json --out /tmp/gate_pooled.json
+"$PY" scripts/estimator_gate.py --cost-only --n 16 --bench-steps 11 --out /tmp/gate_costs.json
 ```
 
-`--device cuda` restricts visibility to physical GPU 1 before importing torch;
-GPU 0 is never used. Processing batches must be at most 32, and the CUDA
-allocator is capped at 4.5 GiB to leave room below the 6 GB process budget.
-Default processing batch size is 4. Timing always uses batch 16.
-`--slow-n N` evaluates B/C/D on a common prefix and emits corresponding control
-prefix rows; `--max-eval-seconds S` retains completed batches if a row reaches
-its time budget. Neither option changes dataset generation. Exact row names
-are accepted by `--estimators` to run independent subsets. The JSON is saved
-after every completed row and contains per-digit errors, assignments, lock
-steps, final nodes, secondary modes, counts, configuration and dataset hash.
+The measured accuracy run used separate 50-sequence shards (`--n 50`,
+`--start-index 0` or `50`, with unchanged `--dataset-size`) in independent CPU
+processes. `--pool-results` rejects overlapping shards, mismatched dataset
+hashes, different specs and unpaired sequence indices.
 
-Implementation validation used `--n 2 --batch-size 2 --self-check
---skip-benchmark`. It checks six-step trajectory parity against the actual
-`AdaptiveNodeCell` with and without clipping; synthetic translation recovery
-with camera compensation at lags 1, 4 and 8; robust-fit units; and a known
-two-mode field. An independent run of the supplied `pr1_sim.py` on two
-sequences matched all 25 final node vectors: maximum absolute differences
-were 8.4e-7 for A and at most 4.8e-7 for all three E variants. The copied Newton
-helper also matched the original helper, including acceptance decisions.
-Blank observations preserved nodes and zero evidence for all 14 estimators;
-their persistent image histories contained only per-sample tensors. A metric
-check confirmed that two close digits sharing one node are not counted as a
-resolved same-cell pair. The locked-stage routing check forces a bimodal LK
-field and verifies that D selects the nearer mode rather than the unclustered
-mean. A real validation sequence exercising the all-negative correlation-peak
-fallback also matched literal PR1 to 7.2e-7 in every final node component.
+Parity and prediction commands (the parity command currently exits nonzero):
 
-All 16 rows (14 estimators/variants plus two references) use **300 sequences**;
-no sample reduction or evaluation time cap was needed. The measured runs used
-batch 4 for A/E and batch 2 for B/C/D, with independent estimator subsets running
-concurrently, each with one OpenBLAS/OMP/PyTorch thread. Timing always used batch
-16. CPU: Intel Xeon Gold 5220R, 2.20 GHz; PyTorch 2.9.0+cu128. CUDA was unavailable.
-The subset outputs were merged only after verifying identical dataset hashes.
-The single-process command above computes the same matrix but takes longer on CPU.
+```bash
+git show 44cb8ed71718f99c8aa2bef980063d62f5fed45d:scripts/estimator_gate.py > /tmp/gate_previous.py
+"$PY" scripts/estimator_gate.py --n 20 --dataset-size 300 --batch-size 2 --parity-reference /tmp/gate_previous.py --out /tmp/gate_parity.json
+CKPT=/tmp/claude-1016/-home-yixunhu-codespace-flowm/831f1992-2b3c-47ed-ba4f-3bd336e0abb9/scratchpad/kwm_bench/runs/adaptive_bs16_ckpt
+"$PY" scripts/estimator_gate.py --prediction-checkpoint "$CKPT" --prediction-cache /tmp/gate_predictions.pt --prediction-n 40 --prediction-seed 778 --batch-size 2 --estimators A_LK,D_lock_LK_2mode_heavier,D_lock_LK_2mode_grid1_heavier --out /tmp/gate_prediction.json
+"$PY" scripts/estimator_gate.py --n 2 --estimators D_lock_LK_2mode_heavier,D_lock_LK_2mode_grid1_heavier --self-check --skip-benchmark --out /tmp/gate_check.json
+```
 
-The saved [JSON](../results/gate_estimator.json) contains all metrics, per-digit
-errors and assignments, lock steps, secondary modes, timings, source-run
-configurations and the paired bootstrap. Its frames-plus-actions SHA-256 is
-`09fafa77ba078b7562bfd2c0851987cd657ba0c4df611ed1949a144ab0b49024`. Bootstrap code is included in the delivered script and runs whenever
-A_LK and comparison rows are present. No existing repository files were modified
-and no commit was created.
+The revision's raw shards, complete per-sequence errors, dataset hashes,
+pooled paired bootstrap, timings, parity check and prediction proxy outputs
+are stored locally in `/tmp/estimator_gate_revision/`. The consolidated
+`results.json` and `costs.json` are the sources for these tables. The original
+300-sequence results file is historical; its C rows contain the old boundary
+bug and are superseded by the corrected tables above.
+
+The expanded `--self-check` passes production-LK trajectory parity, translation
+and camera signs, lag units, robust-fit units, both mode rules, locked LK-mode
+routing, rejection of boundary minima on both grids, and no-grad/fp32 search
+under bf16 autocast. The separate 20-sequence old-D2 comparison fails the
+stricter requested tolerance, as reported above.

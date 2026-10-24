@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """No-learning, online velocity-estimator gate; see docs/GATE_estimator.md.
 
-Example (the script itself restricts CUDA to physical GPU 1):
+Example (CPU only unless explicitly requested otherwise):
   OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 python scripts/estimator_gate.py \
       --n 300 --device cpu --estimators A,B,C,D,E --out results/gate_estimator.json
 
@@ -24,10 +24,10 @@ from pathlib import Path
 import sys
 import time
 
-# Set these before importing torch/numpy. Never touch physical GPU 0.
+# Set these before importing torch/numpy; respect an explicitly hidden GPU.
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
@@ -117,11 +117,11 @@ def robust_velocity(velocities, weights, lags):
     return fit, w.sum(2)
 
 
-def two_modes(displacement, weight, nu, lattice, lag):
+def two_modes(displacement, weight, nu, lattice, lag, rule="nearest"):
     """Weighted k=2 along the principal axis, within a node's reachable cell.
 
     Up to two modes: require >=10% mass in each and separation >=0.1 px/frame.
-    The nearer mode updates the actual node. The other is diagnostic only.
+    Select the nearer or heavier mode; the other is diagnostic only.
     """
     dv = (displacement / lag).flatten(-2).transpose(-1, -2)  # B,V,pixel,xy
     w = weight.flatten(-2)
@@ -146,7 +146,12 @@ def two_modes(displacement, weight, nu, lattice, lag):
     vh = (wh[..., None] * dv).sum(-2) / sh[..., None].clamp_min(1e-6)
     split = (torch.minimum(sl, sh) >= 0.1 * total) & (total > 1e-6)
     split &= (vl - vh).norm(dim=-1) >= THRESHOLD
-    take_left = vl.square().sum(-1) <= vh.square().sum(-1)
+    if rule == "nearest":
+        take_left = vl.square().sum(-1) <= vh.square().sum(-1)
+    elif rule == "heavier":
+        take_left = sl >= sh
+    else:
+        raise ValueError(f"Unknown mode rule: {rule}")
     primary = torch.where(take_left[..., None], vl, vh)
     second = torch.where(take_left[..., None], vh, vl)
     wp = torch.where(take_left, sl, sh)
@@ -170,52 +175,69 @@ def shifted_window_mask(shifts):
 
 
 class LocalSearch:
-    """7x7 residual SSD volume, sigma-2 aggregation, parabolic refinement.
+    """Dense residual SSD volume, sigma-2 aggregation, parabolic refinement.
 
     Compare m(x) to current(x+d). Shifts of the current snapshot are shared
     across nodes/lags. Candidate chunks limit transient memory (no image bank).
     """
-    def __init__(self, current, candidate_chunk=7):
-        self.current = current
+    @torch.no_grad()
+    def __init__(self, current, candidate_chunk=7, radius=1.5):
+        self.current = current.float()
         self.chunk = candidate_chunk
-        axis = torch.arange(-1.5, 1.51, 0.5, device=current.device)
-        yy, xx = torch.meshgrid(axis, axis, indexing="ij")
-        self.shifts = torch.stack([xx, yy], -1).reshape(49, 2)
-        full = pad_world(current)[:, None].expand(-1, 49, -1, -1, -1)
-        self.shifted = spectral_shift(full, -self.shifts[None])[..., :WIN, :WIN]
-        self.mask = shifted_window_mask(-self.shifts)[None, None]
+        if radius not in (1.0, 1.5):
+            raise ValueError("Search radius must be 1.0 or 1.5 pixels")
+        self.radius = radius
+        self.side = int(4 * radius + 1)
+        self.count = self.side**2
+        with torch.autocast(device_type=current.device.type, enabled=False):
+            axis = torch.arange(-radius, radius + 0.01, 0.5, device=current.device)
+            yy, xx = torch.meshgrid(axis, axis, indexing="ij")
+            self.shifts = torch.stack([xx, yy], -1).reshape(self.count, 2)
+            full = pad_world(self.current)[:, None].expand(-1, self.count, -1, -1, -1)
+            self.shifted = spectral_shift(full, -self.shifts[None])[..., :WIN, :WIN]
+            self.shifted_norm = self.shifted.square().sum(2)
+            self.mask = shifted_window_mask(-self.shifts)[None, None]
 
-    def __call__(self, transported, support, sample_indices=None):
+    @torch.no_grad()
+    def __call__(self, transported, support):
+        with torch.autocast(device_type=transported.device.type, enabled=False):
+            return self.search(transported.float(), support.float())
+
+    def search(self, transported, support):
         costs = []
-        for start in range(0, 49, self.chunk):
-            stop = min(start + self.chunk, 49)
+        transported_norm = transported.square().sum(2)
+        for start in range(0, self.count, self.chunk):
+            stop = min(start + self.chunk, self.count)
             valid = support[:, :, None] * self.mask[:, :, start:stop]
             shifted = self.shifted[:, start:stop]
-            if sample_indices is not None:
-                shifted = shifted[sample_indices]
-            diff = transported[:, :, None] - shifted[:, None]
-            ssd = diff.square().sum(3)
+            # Contract channels directly: never allocate B,V,candidate,C,H,W.
+            dot = torch.einsum("bvchw,bkchw->bvkhw", transported, shifted)
+            ssd = (transported_norm[:, :, None]
+                   + self.shifted_norm[:, None, start:stop] - 2 * dot).clamp_min(0)
             mass = gaussian(valid)
             cost = gaussian(ssd * valid) / mass.clamp_min(1e-6)
             costs.append(cost.masked_fill(mass < 0.5, 1e6))
         costs = torch.cat(costs, 2)
         index = costs.argmin(2)
-        iy, ix = index // 7, index % 7
+        iy, ix = index // self.side, index % self.side
 
         def at(i):
             return costs.gather(2, i[:, :, None])[:, :, 0]
 
         center = at(index)
         refined = []
-        for coordinate, stride in ((ix, 1), (iy, 7)):
+        for coordinate, stride in ((ix, 1), (iy, self.side)):
             left = at((index - stride).clamp_min(0))
-            right = at((index + stride).clamp_max(48))
+            right = at((index + stride).clamp_max(self.count - 1))
             curvature = left + right - 2 * center
             offset = (0.5 * (left - right) / curvature.clamp_min(1e-8)).clamp(-0.5, 0.5)
-            interior = (coordinate > 0) & (coordinate < 6) & (curvature > 1e-8)
-            refined.append(-1.5 + 0.5 * (coordinate + torch.where(interior, offset, 0)))
+            interior = (coordinate > 0) & (coordinate < self.side - 1) & (curvature > 1e-8)
+            refined.append(-self.radius + 0.5 * (coordinate + torch.where(interior, offset, 0)))
         displacement = torch.stack(refined, 2)
         usable = (center < 1e5) & (support > 0.99)
+        # Edge minima have no two-sided refinement. At long lags their clamped
+        # displacement can pass the velocity-size gate and corrupt the fit.
+        usable &= (ix > 0) & (ix < self.side - 1) & (iy > 0) & (iy < self.side - 1)
         return displacement, usable
 
 
@@ -336,6 +358,8 @@ class Spec:
     modes: bool = False
     step_clip: float | None = 0.3
     nearest: bool = True
+    mode_rule: str = "nearest"
+    search_radius: float = 1.5
 
 
 SPECS = [
@@ -349,6 +373,11 @@ SPECS = [
     Spec("E_window_strongest124", "E", (1, 2, 4), step_clip=None, nearest=False),
     Spec("E_window_nearest1", "E", step_clip=None),
 ]
+SPECS += [Spec(s.name + "_heavier", s.family, s.lags, modes=True, mode_rule="heavier")
+          for s in SPECS if s.modes]
+SPECS += [Spec("D_lock_LK_2mode_grid1" + suffix, "D", modes=True,
+               mode_rule=rule, search_radius=1.0)
+          for suffix, rule in (("", "nearest"), ("_heavier", "heavier"))]
 
 
 class Estimator:
@@ -362,7 +391,7 @@ class Estimator:
         self.history = deque(maxlen=None if spec.family == "A" else max(spec.lags))
         self.node_history = []  # only needed for the exact A replay
         self.cumulative_camera = torch.zeros(batch, 2, device=device)
-        self.last_search_fraction = 0.0
+        self.last_search_fraction = torch.zeros((), device=device)
 
     def legacy_imprint(self, action):
         """Reconstruct AdaptiveNodeCell's original overwrite/decay recurrence.
@@ -442,23 +471,17 @@ class Estimator:
             else:
                 trace = texture_trace(m)
                 locked = None
-            if locked is None:
-                if search is None:
-                    search = LocalSearch(current)
-                d, usable = search(m, support)
-            else:
-                # D actually skips the volume at locked nodes; the diagnostic
-                # second mode there uses the LK displacement field.
-                d, usable = lk.clone(), torch.ones_like(support, dtype=torch.bool)
-                bi, vi = (~locked).nonzero(as_tuple=True)
-                if len(bi):
-                    if search is None:
-                        search = LocalSearch(current)
-                    selected, valid = search(m[bi, vi][:, None], support[bi, vi][:, None], bi)
-                    d[bi, vi], usable[bi, vi] = selected[:, 0], valid[:, 0]
+            if search is None:
+                search = LocalSearch(current, radius=spec.search_radius)
+            d, usable = search(m, support)
+            if locked is not None:
+                # Dense evaluation and tensor selection avoid dynamic indexing
+                # and host synchronization. Only LK carries a field gradient.
+                d = torch.where(locked[..., None, None, None], lk, d)
+                usable = torch.where(locked[..., None, None], True, usable)
             w = coherence(m, current, trace, d, support * usable, lag)
             if spec.modes:
-                delta, evidence, sv, sw = two_modes(d, w, self.nu, self.lattice, lag)
+                delta, evidence, sv, sw = two_modes(d, w, self.nu, self.lattice, lag, spec.mode_rule)
                 second_v.append(sv)
                 second_w.append(sw)
             else:
@@ -470,7 +493,7 @@ class Estimator:
                 if not spec.modes:
                     delta = torch.where(locked[..., None], ld, delta)
                     evidence = torch.where(locked, le, evidence)
-                self.last_search_fraction = float((~locked).float().mean())
+                self.last_search_fraction = (~locked).float().mean()
             velocities.append(self.nu + delta / lag)
             weights.append(evidence)
             lags.append(lag)
@@ -590,7 +613,124 @@ def benchmark(spec, frames, actions, cell, device, repeats):
         if t >= 9:
             samples.append(time.perf_counter() - start)
     return dict(batch=16, warmup_steps=9, measured_steps=repeats,
-                seconds_per_step=float(np.median(samples)), samples_seconds=samples)
+                seconds_per_step=float(np.median(samples)), samples_seconds=samples,
+                includes_encoding=True)
+
+
+@torch.inference_mode()
+def benchmark_costs(frames, actions, cell, repeats=11):
+    """CPU B=16: full production cell versus estimators on preencoded imprints."""
+    indices = torch.arange(16) % len(frames)
+    frames, actions = frames[indices], actions[indices]
+    currents = [cell.imprint(cell.conv_u(frames[:, t])).float() for t in range(9 + repeats)]
+    nodes = lattice_nodes()
+    h = torch.zeros(16, NODES, cell.C + cell.extra + cell.K_imp, WORLD, WORLD)
+    specs = [s for s in SPECS if s.family == "S" or (s.family == "D" and s.modes)]
+    result = {}
+    for spec in [None] + specs:
+        estimator = None if spec is None else Estimator(spec, 16, torch.device("cpu"))
+        samples = []
+        for t in range(9 + repeats):
+            start = time.perf_counter()
+            if estimator is None:
+                h = cell(frames[:, t], h, actions[:, t], nodes, 1.0)
+            else:
+                estimator.step(currents[t], actions[:, t])
+            if t >= 9:
+                samples.append(time.perf_counter() - start)
+        name = "production_AdaptiveNodeCell" if spec is None else spec.name
+        result[name] = dict(batch=16, warmup_steps=9, measured_steps=repeats,
+                            seconds_per_step=float(np.median(samples)), samples_seconds=samples,
+                            includes_encoding=spec is None)
+        print(f"{name}: {result[name]['seconds_per_step']:.6f} s/step", flush=True)
+    return result
+
+
+@torch.inference_mode()
+def verify_previous(reference_path, frames, actions, cell, batch_size=2):
+    """Compare every D2 node component at every step to a saved old script."""
+    import importlib.util
+
+    module_spec = importlib.util.spec_from_file_location("previous_estimator_gate", reference_path)
+    previous = importlib.util.module_from_spec(module_spec)
+    sys.modules[module_spec.name] = previous
+    cuda_visibility = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    module_spec.loader.exec_module(previous)
+    os.environ["CUDA_VISIBLE_DEVICES"] = cuda_visibility
+    spec = next(s for s in SPECS if s.name == "D_lock_LK_2mode")
+    old_spec = next(s for s in previous.SPECS if s.name == spec.name)
+    maxima, final_maxima = [], []
+    for first in range(0, len(frames), batch_size):
+        f, a = frames[first:first + batch_size], actions[first:first + batch_size]
+        new = Estimator(spec, len(f), torch.device("cpu"))
+        old = previous.Estimator(old_spec, len(f), torch.device("cpu"))
+        differences = []
+        for t in range(f.shape[1]):
+            current = cell.imprint(cell.conv_u(f[:, t])).float()
+            differences.append((new.step(current, a[:, t]) - old.step(current, a[:, t])).abs())
+        differences = torch.stack(differences)
+        maxima.append(float(differences.max()))
+        final_maxima.append(float(differences[-1].max()))
+        print(f"parity: {min(first + batch_size, len(frames))}/{len(frames)}, max={maxima[-1]:.9g}", flush=True)
+    return dict(n=len(frames), steps=frames.shape[1], tolerance=1e-5,
+                max_abs_diff=max(maxima), final_max_abs_diff=max(final_maxima),
+                passed=max(maxima) < 1e-5, batch_max_abs_diff=maxima,
+                reference_sha256=hashlib.sha256(Path(reference_path).read_bytes()).hexdigest())
+
+
+@torch.inference_mode()
+def prediction_proxy(checkpoint_path, specs, cell, n=40, seed=778, batch_size=2, cache=None):
+    """Shared 30-true + 20-self-predicted inputs, updates on, frozen gate imprint.
+
+    This is a proxy, not a D-integrated model or an end-to-end training result.
+    Cache identity includes both checkpoint bytes and generated frames/actions.
+    """
+    from kwm.model import build_model
+
+    checkpoint_path = Path(checkpoint_path)
+    if checkpoint_path.is_dir():
+        checkpoint_path = checkpoint_path / "best.pt"
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    model = build_model(checkpoint["args"]).cpu().eval()
+    model.load_state_dict(checkpoint["model"])
+    model.node_update_pred = True
+    batch = make_batch(n, 30, 20, EnvConfig(real_velocity=True, real_camera=True),
+                       gen=torch.Generator().manual_seed(seed), split="test", device="cpu")
+    frames, actions = batch["frames"], batch["actions"]
+    identity = dict(checkpoint_sha256=hashlib.sha256(checkpoint_path.read_bytes()).hexdigest(),
+                    dataset_sha256=hashlib.sha256(frames.numpy().tobytes() + actions.numpy().tobytes()).hexdigest(),
+                    node_update_pred=True)
+    if cache is not None and cache.exists():
+        saved = torch.load(cache, map_location="cpu", weights_only=True)
+        if saved["identity"] != identity:
+            raise ValueError("Prediction cache does not match checkpoint/dataset/update policy")
+        predictions = saved["predictions"]
+    else:
+        predictions = []
+        for first in range(0, n, batch_size):
+            f, a = frames[first:first + batch_size], actions[first:first + batch_size]
+            predictions.append(model(f[:, :30], a[:, :30], a[:, 30:50]))
+            print(f"prediction frames: {min(first + batch_size, n)}/{n}", flush=True)
+        predictions = torch.cat(predictions)
+        if cache is not None:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(dict(identity=identity, predictions=predictions), cache)
+    result = dict(**identity, checkpoint=str(checkpoint_path), n=n, seed=seed,
+                  prediction_mse=float((predictions - frames[:, 30:50]).square().mean()),
+                  truth_power=float(frames[:, 30:50].square().mean()), rows=[])
+    for kind, inputs in (("true50", frames), ("true30_pred20", torch.cat([frames[:, :30], predictions], 1))):
+        for spec in specs:
+            traj, second, valid, elapsed, _ = run_estimator(
+                spec, inputs, actions, cell, batch_size, torch.device("cpu"))
+            for steps in (30, 50):
+                m, details = metrics(traj[:, :steps], batch["digit_states"]["vel"][:, :steps],
+                                     batch["digit_states"]["visible"][:, :steps],
+                                     second if spec.modes and steps == 50 else None,
+                                     valid if spec.modes and steps == 50 else None)
+                result["rows"].append(dict(name=spec.name, inputs=kind, steps=steps,
+                                            metrics=m, details=details, evaluation_seconds=elapsed))
+                print(kind, steps, spec.name, m["matched_median"], m["matched_gt_0_1"], flush=True)
+    return result
 
 
 def format_table(rows):
@@ -616,6 +756,7 @@ def paired_bootstrap(row, reference, repeats=2000):
     b = np.asarray(row["details"]["matched_error"], dtype=np.float32)
     visible = np.asarray(row["details"]["visible"], dtype=bool)
     assert a.shape == b.shape
+    assert np.array_equal(visible, np.asarray(reference["details"]["visible"][:n], dtype=bool))
     rng = np.random.default_rng(2024)
     medians, failures = [], []
     for _ in range(repeats):
@@ -629,6 +770,73 @@ def paired_bootstrap(row, reference, repeats=2000):
                 matched_median_reduction_ci95=np.quantile(medians, [0.025, 0.975]).tolist(),
                 failure_fraction_reduction_ci95=np.quantile(failures, [0.025, 0.975]).tolist(),
                 note="Descriptive paired bootstrap; not adjusted for selecting among estimators.")
+
+
+def merge_rows(rows):
+    """Pool complete per-sequence details without averaging dataset medians."""
+    if any(r["spec"] != rows[0]["spec"] for r in rows):
+        raise ValueError("Cannot pool different estimator specifications")
+    details = {key: sum((r["details"][key] for r in rows), []) for key in rows[0]["details"]}
+    visible = np.asarray(details["visible"], dtype=bool)
+    lower_median = lambda x: float(np.partition(x, (len(x) - 1) // 2)[(len(x) - 1) // 2])
+    closest = np.asarray(details["closest_error"], dtype=np.float32)[visible]
+    matched = np.asarray(details["matched_error"], dtype=np.float32)[visible]
+    locks = np.asarray(details["first_lock"])[visible]
+    pairs = sum(r["metrics"]["same_cell_pairs"] for r in rows)
+
+    def pair_fraction(key):
+        if not pairs or all(r["metrics"][key] is None for r in rows):
+            return None
+        resolved = sum(round((r["metrics"][key] or 0) * r["metrics"]["same_cell_pairs"]) for r in rows)
+        return resolved / pairs
+
+    return dict(name=rows[0]["name"], spec=rows[0]["spec"], details=details,
+                metrics=dict(n=len(visible), visible_digits=int(visible.sum()),
+                             closest_median=lower_median(closest), matched_median=lower_median(matched),
+                             matched_gt_0_1=float((matched > THRESHOLD).mean()),
+                             lock_median_censored=lower_median(locks), never_locked=float((locks == 30).mean()),
+                             same_cell_pairs=pairs,
+                             same_cell_sequences=sum(r["metrics"]["same_cell_sequences"] for r in rows),
+                             same_cell_both_resolved=pair_fraction("same_cell_both_resolved"),
+                             own_cell_two_modes_resolved=pair_fraction("own_cell_two_modes_resolved")))
+
+
+def pool_results(paths):
+    """Merge disjoint shards per seed, then pair the same sequences across seeds."""
+    groups, hashes = {}, {}
+    for path in paths:
+        payload = json.loads(path.read_text())
+        if not payload["complete"]:
+            raise ValueError(f"Incomplete gate result: {path}")
+        seed, digest = payload["seed"], payload["dataset_sha256"]
+        if seed in hashes and hashes[seed] != digest:
+            raise ValueError(f"Different generated datasets for seed {seed}")
+        hashes[seed] = digest
+        for row in payload["rows"]:
+            if "spec" in row:
+                key = seed, row["name"]
+                groups.setdefault(key, []).append((payload["config"].get("start_index", 0), row))
+    per_seed, indices = {}, {}
+    for (seed, name), parts in groups.items():
+        parts.sort(key=lambda part: part[0])
+        ids = [i for start, row in parts for i in range(start, start + row["metrics"]["n"])]
+        if len(set(ids)) != len(ids):
+            raise ValueError(f"Overlapping sequences: {seed}, {name}")
+        indices[seed, name] = ids
+        per_seed.setdefault(seed, {})[name] = merge_rows([row for _, row in parts])
+    seeds = sorted(per_seed)
+    names = set.intersection(*(set(per_seed[seed]) for seed in seeds))
+    pooled = []
+    for name in sorted(names):
+        for seed in seeds:
+            if indices[seed, name] != indices[seed, "A_LK"]:
+                raise ValueError(f"Unpaired sequence indices: {seed}, {name}")
+        pooled.append(merge_rows([per_seed[seed][name] for seed in seeds]))
+    reference = next(r for r in pooled if r["name"] == "A_LK")
+    return dict(seeds=seeds, dataset_sha256=hashes, per_seed=per_seed, rows=pooled,
+                paired_bootstrap_vs_A_LK={r["name"]: paired_bootstrap(r, reference)
+                                          for r in pooled if r is not reference},
+                table=format_table(pooled))
 
 
 def save_result(path, payload):
@@ -678,6 +886,30 @@ def self_check(cell):
     torch.testing.assert_close(primary[0, 0, 0], d.new_tensor(-0.2))
     torch.testing.assert_close(secondary[0, 0, 0], d.new_tensor(0.4))
     assert evidence.item() > 0
+    unequal = torch.ones(1, 1, 8, 8, device=device)
+    unequal[:, :, 4:] = 2
+    heavy, _, other, _ = two_modes(d, unequal, torch.zeros(1, 1, 2, device=device),
+                                  torch.zeros(1, 2, device=device), 1, "heavier")
+    torch.testing.assert_close(heavy[0, 0, 0], d.new_tensor(0.4))
+    torch.testing.assert_close(other[0, 0, 0], d.new_tensor(-0.2))
+    for radius in (1.0, 1.5):
+        # A >radius translation lands on an unrefined edge; it must never be
+        # accepted, even if division by lag would pass the .6 velocity gate.
+        current = spectral_shift(blob, blob.new_tensor([2.0, 0.0]))[..., :WIN, :WIN]
+        search = LocalSearch(current, radius=radius)
+        disp, usable = search(blob[..., :WIN, :WIN][:, None],
+                              torch.ones(1, 1, WIN, WIN, device=device))
+        edge = (disp.abs() >= radius).any(2)
+        assert edge.any() and not (edge & usable).any()
+    # Explicitly leave inference_mode to exercise the no_grad/autocast contract.
+    with torch.inference_mode(False), torch.enable_grad():
+        current = torch.randn(1, CHANNELS, WIN, WIN, device=device, requires_grad=True)
+        transported = torch.randn(1, 1, CHANNELS, WIN, WIN, device=device, requires_grad=True)
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+            search = LocalSearch(current)
+            disp, _ = search(transported, torch.ones(1, 1, WIN, WIN, device=device))
+        assert disp.dtype == torch.float32 and not disp.requires_grad
+        assert search.shifted.dtype == torch.float32 and not search.shifted.requires_grad
     # Regression: locked D must pool its selected LK mode, not silently put
     # back the unclustered LK mean (+.1 in this deliberately bimodal field).
     from unittest.mock import patch
@@ -694,13 +926,17 @@ def self_check(cell):
         estimator.step(ones, zero_action)
     torch.testing.assert_close(estimator.nu[0, 12, 0], field.new_tensor(-0.1), atol=1e-5, rtol=0)
     torch.testing.assert_close(estimator.second[0, 12, 0], field.new_tensor(0.3), atol=1e-5, rtol=0)
-    print("Self-checks passed: exact LK parity, displacement/camera signs, lag units, WLS, two modes, locked-mode routing.",
+    print("Self-checks passed: LK parity, camera/lag units, WLS, both mode rules, boundary rejection, "
+          "no-grad/fp32 search, locked-mode routing.",
           file=sys.stderr, flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--n", type=int, default=300)
+    parser.add_argument("--seed", type=int, default=2024)
+    parser.add_argument("--dataset-size", type=int, help="generate this many sequences before slicing")
+    parser.add_argument("--start-index", type=int, default=0, help="first sequence in the generated dataset")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--estimators", default="A,B,C,D,E", help="comma-separated families or exact row names")
     parser.add_argument("--out", type=Path, default=Path("results/gate_estimator.json"))
@@ -710,22 +946,42 @@ def main():
     parser.add_argument("--max-eval-seconds", type=float, help="per-estimator CPU/GPU evaluation budget; finish current batch")
     parser.add_argument("--skip-benchmark", action="store_true", help="development only")
     parser.add_argument("--self-check", action="store_true")
+    special = parser.add_mutually_exclusive_group()
+    special.add_argument("--cost-only", action="store_true", help="CPU production/estimator-only timing")
+    special.add_argument("--parity-reference", type=Path, help="saved previous gate script; CPU trajectory check")
+    special.add_argument("--prediction-checkpoint", type=Path, help="CPU 30+20 prediction proxy; directory or .pt")
+    special.add_argument("--pool-results", type=Path, nargs="+", help="merge shards/seeds and paired bootstrap")
+    parser.add_argument("--prediction-n", type=int, default=40)
+    parser.add_argument("--prediction-seed", type=int, default=778)
+    parser.add_argument("--prediction-cache", type=Path)
     args = parser.parse_args()
+    if args.pool_results:
+        result = pool_results(args.pool_results)
+        save_result(args.out, result)
+        print(result["table"])
+        return
+    dataset_size = args.dataset_size or args.n
+    if args.start_index < 0 or args.start_index + args.n > dataset_size:
+        parser.error("start-index + n must fit in dataset-size")
     if args.n < 1 or not 1 <= args.batch_size <= 32 or not 1 <= args.bench_steps <= 21:
         parser.error("n must be positive, batch size 1..32, bench steps 1..21")
     if args.slow_n is not None and not 1 <= args.slow_n <= args.n:
         parser.error("slow-n must be in 1..n")
     if args.max_eval_seconds is not None and args.max_eval_seconds <= 0:
         parser.error("max-eval-seconds must be positive")
+    if args.prediction_n < 1:
+        parser.error("prediction-n must be positive")
     chosen = {x.strip() for x in args.estimators.split(",")}
     known = {"A", "B", "C", "D", "E"} | {s.name for s in SPECS}
     if chosen - known:
         parser.error(f"unknown estimators: {sorted(chosen - known)}")
     specs = [s for s in SPECS if s.name in chosen or s.family in chosen or (s.family == "S" and "A" in chosen)]
     device = torch.device(args.device)
+    if (args.cost_only or args.prediction_checkpoint or args.parity_reference) and device.type != "cpu":
+        parser.error("cost, parity and prediction proxy runs are CPU only")
     if device.type == "cuda":
         if not torch.cuda.is_available():
-            parser.error("CUDA unavailable; use --device cpu. Only physical GPU 1 is allowed.")
+            parser.error("CUDA unavailable or hidden; use --device cpu")
         # Includes allocator overhead; transient volume chunks keep usage much lower.
         total = torch.cuda.get_device_properties(device).total_memory
         torch.cuda.set_per_process_memory_fraction(min(0.9, 4.5 * 1024**3 / total), device)
@@ -740,17 +996,33 @@ def main():
     with torch.inference_mode(), torch.autocast(device_type=device.type, enabled=False):
         if args.self_check:
             self_check(cell)
-        # One CPU generation call gives exactly make_batch(n,...,seed=2024),
-        # independent of processing batch size, slow-n and estimator selection.
-        batch = make_batch(args.n, 30, 0, EnvConfig(real_velocity=True, real_camera=True),
-                           gen=torch.Generator().manual_seed(2024), split="test", device="cpu")
+        if args.prediction_checkpoint:
+            result = prediction_proxy(args.prediction_checkpoint, specs, cell, args.prediction_n,
+                                      args.prediction_seed, args.batch_size, args.prediction_cache)
+            save_result(args.out, result)
+            return
+        # Generate once before slicing: changing generation batch size changes
+        # RNG consumption. Seed 2024 comparisons use the original 300's prefix.
+        batch = make_batch(dataset_size, 30, 0, EnvConfig(real_velocity=True, real_camera=True),
+                           gen=torch.Generator().manual_seed(args.seed), split="test", device="cpu")
         frames, actions = batch["frames"], batch["actions"]
         truth, visible = batch["digit_states"]["vel"], batch["digit_states"]["visible"]
         digest = hashlib.sha256(frames.numpy().tobytes() + actions.numpy().tobytes()).hexdigest()
-        payload = dict(schema_version=1, complete=False,
+        subset = slice(args.start_index, args.start_index + args.n)
+        frames, actions, truth, visible = [x[subset] for x in (frames, actions, truth, visible)]
+        if args.parity_reference:
+            result = verify_previous(args.parity_reference, frames, actions, cell, args.batch_size)
+            save_result(args.out, result)
+            if not result["passed"]:
+                raise SystemExit(f"D2 parity failed: {result['max_abs_diff']:.9g} >= 1e-5; see {args.out}")
+            return
+        if args.cost_only:
+            save_result(args.out, benchmark_costs(frames, actions, cell, args.bench_steps))
+            return
+        payload = dict(schema_version=2, complete=False,
                        requested_estimators=[s.name for s in specs], completed_estimators=[],
-                       config=vars(args) | {"out": str(args.out)},
-                       environment=batch["cfg"], seed=2024, cell_seed=0, observed_frames=30,
+                       config={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+                       environment=batch["cfg"], seed=args.seed, cell_seed=0, observed_frames=30,
                        imprint="untrained AdaptiveNodeCell(C=32,num_v=25), K=8, fixed P, s=1",
                        dtype="float32; autocast and TF32 disabled", dataset_sha256=digest,
                        torch_version=torch.__version__, device=str(device),
