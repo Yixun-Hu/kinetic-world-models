@@ -10,7 +10,9 @@ sets are generated once and cached in `results/val_cache_*.pt`. Evaluation resul
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt          # tested with torch 2.14, torchvision 0.29, Python 3.12
-pytest -q                                # 68 tests, about 10 s on CPU
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
+pytest -q                                # 95 passed, 2 slow cases skipped; about 53 s on CPU
+KWM_SLOW=1 pytest -q                     # 97 passed, about 129 s; pytest -m slow selects only the two slow cases
 ```
 
 ## Command reference
@@ -25,6 +27,8 @@ python -m kwm.eval --help
 | `--model flowm` | FloWM: integer velocity lattice, memory moved by `torch.roll` |
 | `--model spectral` | memory moved by a Fourier phase shift, fixed lattice of 25 velocities |
 | `--model adaptive` | spectral transport with adaptive velocity nodes (the main model) |
+| `--node_update lock` | opt-in lock-then-refine estimator; default `lk`; evaluation defaults to the saved rule |
+| `--imprint_gamma` | LK imprint decay; no effect with `--node_update lock` |
 | `--model oracle` | spectral transport with the nodes set to each sequence's true digit velocities (diagnostic) |
 | `--real_velocity`, `--real_camera` | real-valued digit velocities / camera motion (default: integers, FloWM's setting) |
 | `--walls`, `--odometry_noise` | reflecting walls, noisy actions (implemented, not used in RESULTS.md) |

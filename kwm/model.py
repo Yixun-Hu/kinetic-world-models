@@ -19,8 +19,8 @@ Protocol (identical to FloWM's FlowEquivariantRNN.forward):
   (dec_input='zero' feeds zeros instead of prev: pure free-running memory.)
 
 Memory h [B,V,C(+extra),W,W] in the ego frame, window = top-left corner.
-Adaptive node_update='lock' instead uses LockState(features, nodes, snapshot,
-camera), keeping estimator state compact and fp32 independently of features.
+Adaptive node_update='lock' instead uses LockState(features, nodes, snapshot),
+keeping estimator state compact and fp32 independently of features.
 Readout: 'max'     -> max over V (FloWM)
          'moments' -> [mass (C), mean velocity (2), velocity spread (1), max (C)] -> 1x1 conv to C, where
                       w_i(x) = softmax_i(beta * e_i / max_j e_j), e_i = ||h_i(x)||_C
@@ -72,7 +72,7 @@ class KineticWM(nn.Module):
         self._rel = None
         self.oracle = kind == "oracle"            # nodes = per-sequence true digit velocities + (0,0)
         self._nodes_ovr = None
-        self.state_extra = 0                       # LK: 3+K spatial channels; lock: 4 compact node scalars
+        self.state_extra = 0                       # Extra spatial channels only; lock metadata is separate.
         self.collision_kind = collision
         self.wall_mode, self.bounce_mode, self.wall_band = wall_mode, bounce_mode, wall_band
         self.bounce, self.rigid_K, self.rigid_eps, self.rigid_eps_rel = bounce, rigid_K, rigid_eps, rigid_eps_rel
@@ -101,9 +101,7 @@ class KineticWM(nn.Module):
                     raise ValueError("adaptive supports --collision none or bounce")
                 self.cell = AdaptiveNodeCell(in_ch, C, world, window, num_v=V, spacing=node_spacing,
                                              imprint_k=imprint_k, gamma=imprint_gamma, node_update=node_update)
-                # LockState stores these four scalars compactly and its K-channel
-                # snapshot separately, never repeated over V or the world map.
-                self.state_extra = self.cell.extra + (self.cell.K_imp if node_update == "lk" else 0)
+                self.state_extra = self.cell.extra + self.cell.K_imp if node_update == "lk" else 0
             else:
                 self.cell = KineticCell(in_ch, C, world, window, num_v=V)
         self.num_v = self.cell.num_v
@@ -131,6 +129,12 @@ class KineticWM(nn.Module):
         self.decoder_conv = nn.Sequential(*dec)
 
     # ------------------------------------------------------------------
+    def initial_state(self, observation):
+        """Allocate the recurrence's tensor or compact LockState."""
+        if self.kind == "adaptive":
+            return self.cell.initial_state(observation)
+        return observation.new_zeros(observation.shape[0], self.num_v, self.C, self.world, self.world)
+
     def nodes(self):
         if self._nodes_ovr is not None:
             return self._nodes_ovr                                            # [B,V,2] oracle nodes
@@ -200,10 +204,7 @@ class KineticWM(nn.Module):
                 coll = lambda hh: bounce_back(hh, nodes, px, py, wall, self.bounce_mode)
         elif self.coll is not None:
             coll = self.coll
-        if self.kind == "adaptive" and self.node_update == "lock":
-            h_new = self.cell(frame, h, a, nodes, dt, coll, update_nodes=update_nodes)
-        else:
-            h_new = self.cell(frame, h, a, nodes, dt, coll)
+        h_new = self.cell(frame, h, a, nodes, dt, coll, update_nodes=update_nodes)
         if self._node_traj is not None and self.kind == "adaptive":
             self._node_traj.append((nodes[None].float() + self.cell.offsets(h_new)).detach()
                                    if self.node_update == "lock" else self.cell.last_nodes)
@@ -256,10 +257,7 @@ class KineticWM(nn.Module):
         B, T_in = obs.shape[:2]
         T_pred = actions_out.shape[1]
         dev = obs.device
-        if self.kind == "adaptive" and self.node_update == "lock":
-            h = self.cell.initial_state(obs[:, 0])
-        else:
-            h = obs.new_zeros(B, self.num_v, self.C + self.state_extra, self.world, self.world)
+        h = self.initial_state(obs[:, 0])
         wall = None
         if self.collision_kind == "bounce":
             if self.wall_mode == "known":

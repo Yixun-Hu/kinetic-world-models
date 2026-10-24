@@ -1,20 +1,21 @@
-"""Functional fp32 lock/search estimator, ported from estimator_gate D2 heavier.
+"""Functional fp32 lock-then-refine estimator with per-node texture and damping.
 
 No estimator history lives here: the cell owns an explicit LockState value.
+See docs/PR1_lock_nodes.md for thresholds, state layout and gradient routing.
 """
+from functools import lru_cache
 from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
 
-from .transport import spectral_shift, lk_displacement
+from .transport import _phase, lk_displacement
 
 
 class LockState(NamedTuple):
     features: torch.Tensor  # [B,V,C,H,W], feature/autocast dtype
     nodes: torch.Tensor     # [B,V,4], fp32: rho_x, rho_y, evidence, locked
     snapshot: torch.Tensor  # [B,K,win,win], fp32, shared by all nodes
-    camera: torch.Tensor    # [B,2], fp32 cumulative action at the snapshot
 
 
 def features(h):
@@ -23,6 +24,27 @@ def features(h):
 
 def pad_world(x, world):
     return F.pad(x, (0, world - x.shape[-1], 0, world - x.shape[-2]))
+
+
+def shift_snapshot(snapshot, shifts, world):
+    """One forward FFT per snapshot, broadcast over node/candidate phases.
+
+    snapshot: [B,K,win,win]; shifts: [B,V,2] (or [1,V,2]). The
+    inverse FFT still produces each transported view; gradients reach both
+    the snapshot and shifts. Phases modify only the materialized node spectra.
+    """
+    spectrum = torch.fft.rfft2(pad_world(snapshot.float(), world))
+    phase = _phase(world, world, shifts[:, :, None], snapshot.device)
+    # Match the expanded-snapshot FFT's B,K,V,H,freq storage order. Merely
+    # broadcasting spectrum during multiplication changes CPU complex-multiply
+    # rounding, which discrete mode decisions can amplify across steps.
+    spectrum = spectrum[:, None].expand(-1, shifts.shape[1], -1, -1, -1)
+    spectrum = spectrum.transpose(1, 2).contiguous().transpose(1, 2)
+    if phase.requires_grad:
+        spectrum = spectrum * phase
+    else:
+        spectrum.mul_(phase)
+    return torch.fft.irfft2(spectrum, s=(world, world))
 
 
 def gaussian(x, sigma=2.0, radius=6):
@@ -45,7 +67,7 @@ def gaussian(x, sigma=2.0, radius=6):
 def coherence(m, current, trace, displacement, support=None, lag=1, tr_rel=0.1, gate=0.6, coh_rel=0.5):
     """KWM's mass, texture, residual-size and *unwarped* agreement gates."""
     weight = m.norm(dim=2)
-    weight *= trace > tr_rel * trace.mean((1, 2, 3), keepdim=True)
+    weight *= trace > tr_rel * trace.mean((2, 3), keepdim=True)
     weight *= displacement.abs().amax(2) / lag <= gate
     sigma = coh_rel * current.norm(dim=1).mean((1, 2)) + 1e-6
     mismatch = (m - current[:, None]).square().sum(2)
@@ -114,6 +136,17 @@ def shifted_window_mask(shifts, world, win):
     return F.grid_sample(mask, grid, align_corners=True)[:, 0].reshape(*shifts.shape[:-1], win, win)
 
 
+@lru_cache(maxsize=16)
+@torch.no_grad()
+def _candidate_geometry(world, win, radius, device):
+    """Cache only fixed geometry, never observations or recurrent state."""
+    axis = torch.arange(-radius, radius + 0.01, 0.5, device=device)
+    yy, xx = torch.meshgrid(axis, axis, indexing="ij")
+    shifts = torch.stack([xx, yy], -1).reshape(-1, 2)
+    mask = shifted_window_mask(-shifts, world, win)[None, None]
+    return shifts, mask
+
+
 class LocalSearch:
     """Dense residual SSD volume, sigma-2 aggregation, parabolic refinement.
 
@@ -131,13 +164,9 @@ class LocalSearch:
         self.side = int(4 * radius + 1)
         self.count = self.side**2
         with torch.autocast(device_type=current.device.type, enabled=False):
-            axis = torch.arange(-radius, radius + 0.01, 0.5, device=current.device)
-            yy, xx = torch.meshgrid(axis, axis, indexing="ij")
-            self.shifts = torch.stack([xx, yy], -1).reshape(self.count, 2)
-            full = pad_world(self.current, world)[:, None].expand(-1, self.count, -1, -1, -1)
-            self.shifted = spectral_shift(full, -self.shifts[None])[..., :win, :win]
+            self.shifts, self.mask = _candidate_geometry(world, win, radius, current.device)
+            self.shifted = shift_snapshot(self.current, -self.shifts[None], world)[..., :win, :win]
             self.shifted_norm = self.shifted.square().sum(2)
-            self.mask = shifted_window_mask(-self.shifts, world, win)[None, None]
 
     @torch.no_grad()
     def __call__(self, transported, support):
@@ -193,14 +222,13 @@ def lock_measurement(previous, current, nu, lattice, action, world, dt=1.0,
     with torch.autocast(device_type=current.device.type, enabled=False):
         current, previous, nu = current.float(), previous.float(), nu.float()
         shift = nu * dt - action.float()[:, None]
-        m = spectral_shift(pad_world(previous, world)[:, None].expand(-1, nu.shape[1], -1, -1, -1),
-                           shift)[..., :current.shape[-2], :current.shape[-1]]
-        lk, trace = lk_displacement(m, current, lam_rel, return_trace=True)
+        m = shift_snapshot(previous, shift, world)[..., :current.shape[-2], :current.shape[-1]]
+        lk, trace = lk_displacement(m, current, lam_rel, return_trace=True, per_node_damping=True)
         with torch.no_grad():
             support = shifted_window_mask(shift, world, current.shape[-1])
             lw = coherence(m, current, trace, lk, support, dt, tr_rel, gate, coh_rel)
             ld, le = pool(lk, lw)
-            textured = m.norm(dim=2) * (trace > tr_rel * trace.mean((1, 2, 3), keepdim=True)) * support
+            textured = m.norm(dim=2) * (trace > tr_rel * trace.mean((2, 3), keepdim=True)) * support
             agreement = le / textured.sum((-2, -1)).clamp_min(1e-6)
             locked = (agreement >= 0.1) & ((ld / dt).norm(dim=-1) <= 0.3)
             d, usable = LocalSearch(current, world)(m, support)

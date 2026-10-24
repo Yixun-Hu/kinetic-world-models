@@ -78,7 +78,7 @@ def boost_transform_nodes(h, nodes, spacing, C, nu_hat, bound, extra=3):
     Lattice part: channels permuted by k = round(u / spacing); rho += u - k*spacing; if |rho| exceeds the
     (overlapping-cell) bound the node carries to the neighbouring lattice node (rho -= +-spacing). W is unchanged.
     h [B,V,C+3+K,H,W] (features | rho, W | imprint). Node-level permutation; nodes pushed off the lattice are
-    dropped. Also accepts LockState: its per-sample snapshot/camera stay in the
+    dropped. Also accepts LockState: its per-sample snapshot stays in the
     same comoving observation frame. Returns (h', target_mask [B,V])."""
     if isinstance(h, LockState):
         H, W = h.features.shape[-2:]
@@ -87,7 +87,7 @@ def boost_transform_nodes(h, nodes, spacing, C, nu_hat, bound, extra=3):
         st = transformed[:, :, C:, 0, 0]
         # A merged target is locked only if all of its contributing mass was.
         st = torch.cat([st[..., :3], (st[..., 3:] >= 1 - 1e-6).float()], -1)
-        return LockState(transformed[:, :, :C].to(h.features.dtype), st, h.snapshot, h.camera), mask
+        return LockState(transformed[:, :, :C].to(h.features.dtype), st, h.snapshot), mask
     B, V, _, H, W = h.shape
     E = extra
     ij, lo, n, table = _lattice_index(nodes.to(h.device).float(), spacing)

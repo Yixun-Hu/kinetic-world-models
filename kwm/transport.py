@@ -108,7 +108,8 @@ def _gauss5(sigma=1.0, device="cpu"):
     return (g[:, None] * g[None, :])[None, None]                            # [1,1,5,5]
 
 
-def lk_displacement(h, u, lam_rel=1e-2, sigma=1.0, eps=1e-3, max_disp=1.0, return_trace=False):
+def lk_displacement(h, u, lam_rel=1e-2, sigma=1.0, eps=1e-3, max_disp=1.0, return_trace=False,
+                    *, per_node_damping=False):
     """One-step Lucas-Kanade estimate of the extra per-step displacement of transported content.
 
     h: [B, V, C, h, w] transported maps on the observed window (the adaptive-node model uses its observation
@@ -119,13 +120,15 @@ def lk_displacement(h, u, lam_rel=1e-2, sigma=1.0, eps=1e-3, max_disp=1.0, retur
     the local part bounds the condition number on edges (aperture problem), the global part sends d -> 0 where
     there is no texture. d is clamped to +-max_disp px. Returns d [B, V, 2, h, w] (dx, dy).
     Differentiable (closed-form 2x2 inverse); always computed in float32 (autocast disabled: G in bf16 cancels).
+    With per_node_damping=True, the reference trace averages pixels separately
+    for each node, so a node's damping is independent of other lattice nodes.
     """
     with torch.autocast(device_type=h.device.type, enabled=False):
-        d, tr2 = _lk_fp32(h.float(), u.float(), lam_rel, sigma, eps, max_disp)
+        d, tr2 = _lk_fp32(h.float(), u.float(), lam_rel, sigma, eps, max_disp, per_node_damping)
     return (d, tr2) if return_trace else d
 
 
-def _lk_fp32(h, u, lam_rel, sigma, eps, max_disp):
+def _lk_fp32(h, u, lam_rel, sigma, eps, max_disp, per_node_damping=False):
     B, V, C, H, W = h.shape
     hf = h
     e = hf - u[:, None]
@@ -138,7 +141,8 @@ def _lk_fp32(h, u, lam_rel, sigma, eps, max_disp):
                                                            mode="replicate"), k).reshape(B, V, 5, H, W)
     gxx, gxy, gyy, bx, by = t.unbind(2)
     tr2 = 0.5 * (gxx + gyy)
-    lam = lam_rel * (tr2 + tr2.mean((1, 2, 3), keepdim=True)) + eps           # [B,V,H,W]
+    dims = (2, 3) if per_node_damping else (1, 2, 3)
+    lam = lam_rel * (tr2 + tr2.mean(dims, keepdim=True)) + eps              # [B,V,H,W]
     a, c = gxx + lam, gyy + lam
     det = (a * c - gxy * gxy).clamp_min(lam * lam)                            # PSD + lam I: det >= lam^2
     dx = (c * bx - gxy * by) / det

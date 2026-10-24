@@ -69,9 +69,11 @@ def digit_masks(cent, half, cam, world, win):
 
 
 # ------------------------------------------------------------ rollouts ----
-def load_model(run, which, device):
+def load_model(run, which, device, node_update=None):
     ck = torch.load(os.path.join(run, f"{which}.pt"), map_location=device, weights_only=False)
-    args = ck["args"]
+    args = dict(ck["args"])
+    if node_update is not None:
+        args["node_update"] = node_update
     m = build_model(args).to(device)
     m.load_state_dict(ck["model"])
     m.eval()
@@ -272,6 +274,8 @@ def main(argv=None):
     p.add_argument("--tag", default=None, help="suffix for the output files (eval_<tag>.json)")
     p.add_argument("--node_update_pred", default=None, choices=[None, "on", "off"],
                    help="adaptive: override whether nodes/imprints are updated during the prediction phase")
+    p.add_argument("--node_update", default=None, choices=["lk", "lock"],
+                   help="adaptive estimator override; default: checkpoint's saved value (lk for older checkpoints)")
     # boost equivariance (on / off the velocity lattice)
     p.add_argument("--equiv_boost", action="store_true", help="boost equivariance of the memory (t=10,30) and of the predictions (t=10,20)")
     p.add_argument("--n_equiv", type=int, default=48)
@@ -286,7 +290,7 @@ def main(argv=None):
     out_dir = a.out or os.path.join(ROOT, "results", name)
     os.makedirs(out_dir, exist_ok=True)
 
-    model, args, step = load_model(a.run, a.ckpt, device)
+    model, args, step = load_model(a.run, a.ckpt, device, node_update=a.node_update)
     if a.node_update_pred is not None:
         model.node_update_pred = a.node_update_pred == "on"
         args = dict(args, node_update_pred=a.node_update_pred)
@@ -305,7 +309,7 @@ def main(argv=None):
     kinetic = args["model"] != "flowm"
     res = dict(run=name, ckpt=a.ckpt, step=step, model=args["model"], params=count_params(model),
                num_v=model.num_v, env=cfg.to_dict(), n_val=n_val, tag=a.tag,
-               node_update_pred=getattr(model, "node_update_pred", None),
+               node_update=model.node_update, node_update_pred=getattr(model, "node_update_pred", None),
                readout_rel=getattr(model, "readout_rel", None))
 
     # ---------------- adaptive: node velocity error at the end of the observation ----------------

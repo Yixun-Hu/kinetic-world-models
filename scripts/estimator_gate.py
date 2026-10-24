@@ -81,10 +81,10 @@ def texture_trace(m):
     return gaussian((gx.square() + gy.square()).sum(2) / 2, 1.0, 2)
 
 
-def coherence(m, current, trace, displacement, support=None, lag=1):
+def coherence(m, current, trace, displacement, support=None, lag=1, *, per_node=False):
     """KWM's mass, texture, residual-size and *unwarped* agreement gates."""
     weight = m.norm(dim=2)
-    weight *= trace > 0.1 * trace.mean((1, 2, 3), keepdim=True)
+    weight *= trace > 0.1 * trace.mean((2, 3) if per_node else (1, 2, 3), keepdim=True)
     weight *= displacement.abs().amax(2) / lag <= 0.6
     sigma = 0.5 * current.norm(dim=1).mean((1, 2)) + 1e-6
     mismatch = (m - current[:, None]).square().sum(2)
@@ -360,6 +360,7 @@ class Spec:
     nearest: bool = True
     mode_rule: str = "nearest"
     search_radius: float = 1.5
+    per_node: bool = False
 
 
 SPECS = [
@@ -378,6 +379,8 @@ SPECS += [Spec(s.name + "_heavier", s.family, s.lags, modes=True, mode_rule="hea
 SPECS += [Spec("D_lock_LK_2mode_grid1" + suffix, "D", modes=True,
                mode_rule=rule, search_radius=1.0)
           for suffix, rule in (("", "nearest"), ("_heavier", "heavier"))]
+SPECS += [Spec("D_lock_LK_2mode_grid1_heavier_pernode", "D", modes=True,
+               mode_rule="heavier", search_radius=1.0, per_node=True)]
 
 
 class Estimator:
@@ -439,13 +442,13 @@ class Estimator:
                 fit, evidence = robust_velocity(velocities, weights, lags)
                 self.update(fit - self.nu, evidence)
             else:
-                self.local_step(current)
+                self.local_step(current, action)
         self.history.append((current, self.cumulative_camera))
         if spec.family == "A":
             self.node_history.append(self.nu.clone())
         return self.nu
 
-    def local_step(self, current):
+    def local_step(self, current, action):
         spec = self.spec
         search = None
         velocities, weights, second_v, second_w, lags = [], [], [], [], []
@@ -453,16 +456,20 @@ class Estimator:
             if len(self.history) < lag:
                 continue
             old, camera = self.history[-lag]
-            shift = self.nu * lag - (self.cumulative_camera - camera)[:, None]
+            # The final lag-1 rule uses the measured action directly. Older
+            # variants retain cumulative subtraction for reproducibility.
+            camera_delta = action if spec.per_node else self.cumulative_camera - camera
+            shift = self.nu * lag - camera_delta[:, None]
             m = spectral_shift(pad_world(old)[:, None].expand(-1, NODES, -1, -1, -1), shift)[..., :WIN, :WIN]
             support = shifted_window_mask(shift)
             if spec.family in ("D", "S"):
-                lk, trace = lk_displacement(m, current, return_trace=True)
-                lw = coherence(m, current, trace, lk, support)
+                lk, trace = lk_displacement(m, current, return_trace=True, per_node_damping=spec.per_node)
+                lw = coherence(m, current, trace, lk, support, per_node=spec.per_node)
                 ld, le = pool(lk, lw)
                 # Evidence normalized by textured imprint mass is an agreement
                 # score. Re-evaluate every step, so a node can unlock again.
-                textured = m.norm(dim=2) * (trace > 0.1 * trace.mean((1, 2, 3), keepdim=True)) * support
+                dims = (2, 3) if spec.per_node else (1, 2, 3)
+                textured = m.norm(dim=2) * (trace > 0.1 * trace.mean(dims, keepdim=True)) * support
                 agreement = le / textured.sum((-2, -1)).clamp_min(1e-6)
                 locked = (agreement >= 0.1) & (ld.norm(dim=-1) <= 0.3)
                 if spec.family == "S":
@@ -479,7 +486,7 @@ class Estimator:
                 # and host synchronization. Only LK carries a field gradient.
                 d = torch.where(locked[..., None, None, None], lk, d)
                 usable = torch.where(locked[..., None, None], True, usable)
-            w = coherence(m, current, trace, d, support * usable, lag)
+            w = coherence(m, current, trace, d, support * usable, lag, per_node=spec.per_node)
             if spec.modes:
                 delta, evidence, sv, sw = two_modes(d, w, self.nu, self.lattice, lag, spec.mode_rule)
                 second_v.append(sv)
@@ -648,7 +655,11 @@ def benchmark_costs(frames, actions, cell, repeats=11):
 
 @torch.inference_mode()
 def verify_previous(reference_path, frames, actions, cell, batch_size=2):
-    """Compare every D2 node component at every step to a saved old script."""
+    """Compare historical two-mode lock trajectories across SSD arithmetic.
+
+    The norm/dot contraction is accepted within 1e-4 of explicit differences;
+    this does not compare the intentionally revised per-node rule.
+    """
     import importlib.util
 
     module_spec = importlib.util.spec_from_file_location("previous_estimator_gate", reference_path)
@@ -672,9 +683,9 @@ def verify_previous(reference_path, frames, actions, cell, batch_size=2):
         maxima.append(float(differences.max()))
         final_maxima.append(float(differences[-1].max()))
         print(f"parity: {min(first + batch_size, len(frames))}/{len(frames)}, max={maxima[-1]:.9g}", flush=True)
-    return dict(n=len(frames), steps=frames.shape[1], tolerance=1e-5,
+    return dict(n=len(frames), steps=frames.shape[1], tolerance=1e-4,
                 max_abs_diff=max(maxima), final_max_abs_diff=max(final_maxima),
-                passed=max(maxima) < 1e-5, batch_max_abs_diff=maxima,
+                passed=max(maxima) < 1e-4, batch_max_abs_diff=maxima,
                 reference_sha256=hashlib.sha256(Path(reference_path).read_bytes()).hexdigest())
 
 
@@ -1014,7 +1025,8 @@ def main():
             result = verify_previous(args.parity_reference, frames, actions, cell, args.batch_size)
             save_result(args.out, result)
             if not result["passed"]:
-                raise SystemExit(f"D2 parity failed: {result['max_abs_diff']:.9g} >= 1e-5; see {args.out}")
+                raise SystemExit(f"Historical lock parity failed: {result['max_abs_diff']:.9g} "
+                                 f">= {result['tolerance']}; see {args.out}")
             return
         if args.cost_only:
             save_result(args.out, benchmark_costs(frames, actions, cell, args.bench_steps))

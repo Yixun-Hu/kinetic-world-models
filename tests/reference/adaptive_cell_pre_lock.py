@@ -1,4 +1,4 @@
-"""Frozen pre-lock AdaptiveNodeCell from branch pr1-lock-nodes, for bitwise regression."""
+"""Frozen AdaptiveNodeCell from main@302d8f8, for bitwise regression."""
 import torch
 import torch.nn as nn
 

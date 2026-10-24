@@ -76,6 +76,9 @@ from a digit's velocity in the median.*
 
 ## Quick start
 
+`--model adaptive --node_update lock` enables lock-then-refine velocity updates;
+the default is `lk`. See [the method and evidence](docs/PR1_lock_nodes.md).
+
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
