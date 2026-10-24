@@ -12,6 +12,7 @@ For the adaptive-node model the boost moves every node velocity nu_i = lattice_i
 import torch
 
 from .transport import spectral_shift
+from .lock_nodes import LockState, features
 
 
 def _lattice_index(nodes, spacing):
@@ -28,6 +29,7 @@ def _lattice_index(nodes, spacing):
 
 def boost_transform(h, nodes, spacing, C, nu_hat, t):
     """Apply the boost nu_hat ([B,2]) to the feature channels of memory h ([B,V,>=C,H,W]) observed for t steps."""
+    h = features(h)
     B, V, _, H, W = h.shape
     dev = h.device
     ij, lo, n, table = _lattice_index(nodes.to(dev).float(), spacing)
@@ -63,7 +65,7 @@ def interior_mask(nodes, spacing):
 
 def equiv_error(h_transformed, h_boosted, C, mask=None):
     """Per-sequence normalised L2 error on the feature channels (optionally only nodes in mask [B,V]). -> [B]"""
-    a, b = h_transformed[:, :, :C], h_boosted[:, :, :C]
+    a, b = features(h_transformed)[:, :, :C], features(h_boosted)[:, :, :C]
     if mask is not None:
         m = mask[:, :, None, None, None].to(a.dtype)
         a, b = a * m, b * m
@@ -71,14 +73,23 @@ def equiv_error(h_transformed, h_boosted, C, mask=None):
     return (a - b).norm(dim=1) / b.norm(dim=1).clamp_min(1e-8)
 
 
-def boost_transform_nodes(h, nodes, spacing, C, nu_hat, bound):
+def boost_transform_nodes(h, nodes, spacing, C, nu_hat, bound, extra=3):
     """Comoving boost action on an adaptive-node memory: every node velocity nu_i = lattice_i + rho_i moves by u.
     Lattice part: channels permuted by k = round(u / spacing); rho += u - k*spacing; if |rho| exceeds the
     (overlapping-cell) bound the node carries to the neighbouring lattice node (rho -= +-spacing). W is unchanged.
     h [B,V,C+3+K,H,W] (features | rho, W | imprint). Node-level permutation; nodes pushed off the lattice are
-    dropped. Returns (h', target_mask [B,V])."""
+    dropped. Also accepts LockState: its per-sample snapshot/camera stay in the
+    same comoving observation frame. Returns (h', target_mask [B,V])."""
+    if isinstance(h, LockState):
+        H, W = h.features.shape[-2:]
+        packed = torch.cat([h.features.float(), h.nodes[..., None, None].expand(-1, -1, -1, H, W)], 2)
+        transformed, mask = boost_transform_nodes(packed, nodes, spacing, C, nu_hat, bound, extra=4)
+        st = transformed[:, :, C:, 0, 0]
+        # A merged target is locked only if all of its contributing mass was.
+        st = torch.cat([st[..., :3], (st[..., 3:] >= 1 - 1e-6).float()], -1)
+        return LockState(transformed[:, :, :C].to(h.features.dtype), st, h.snapshot, h.camera), mask
     B, V, _, H, W = h.shape
-    E = 3
+    E = extra
     ij, lo, n, table = _lattice_index(nodes.to(h.device).float(), spacing)
     rho = h[:, :, C:C + 2].float().mean((-2, -1))                                # [B,V,2]
     k = torch.round(nu_hat / spacing)                                             # [B,2]

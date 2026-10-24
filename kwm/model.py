@@ -19,6 +19,8 @@ Protocol (identical to FloWM's FlowEquivariantRNN.forward):
   (dec_input='zero' feeds zeros instead of prev: pure free-running memory.)
 
 Memory h [B,V,C(+extra),W,W] in the ego frame, window = top-left corner.
+Adaptive node_update='lock' instead uses LockState(features, nodes, snapshot,
+camera), keeping estimator state compact and fp32 independently of features.
 Readout: 'max'     -> max over V (FloWM)
          'moments' -> [mass (C), mean velocity (2), velocity spread (1), max (C)] -> 1x1 conv to C, where
                       w_i(x) = softmax_i(beta * e_i / max_j e_j), e_i = ||h_i(x)||_C
@@ -34,6 +36,7 @@ import torch.nn as nn
 import torch.utils.checkpoint as ckpt
 
 from .cells import FloWMCell, KineticCell, AdaptiveNodeCell
+from .lock_nodes import LockState, features
 from .collision import (lattice_nodes, reflection_perms, bounce_back, rigid_bounce_back,
                         known_wall_field, WallEncoder, VMixing, MLPCollision)
 from .transport import spectral_shift
@@ -55,7 +58,7 @@ class KineticWM(nn.Module):
                  bounce="rigid", rigid_K=28, rigid_eps=1e-3, rigid_eps_rel=0.05,
                  dec_input="flowm", beta_init=10.0, grad_ckpt=False,
                  n_digits=5, imprint_k=8, imprint_gamma=0.9,
-                 node_update_pred=True, readout_rel=False):
+                 node_update_pred=True, readout_rel=False, node_update="lk"):
         super().__init__()
         if kind not in MODELS:
             raise ValueError(f"model must be one of {MODELS}")
@@ -64,11 +67,12 @@ class KineticWM(nn.Module):
         self.kind, self.C, self.world, self.window = kind, C, world, window
         self.dec_input, self.grad_ckpt = dec_input, grad_ckpt
         self.node_update_pred = node_update_pred   # adaptive: keep updating nodes / imprints on the model's own predictions
+        self.node_update = node_update
         self.readout_rel = readout_rel             # moment readout uses velocities relative to the observer
         self._rel = None
         self.oracle = kind == "oracle"            # nodes = per-sequence true digit velocities + (0,0)
         self._nodes_ovr = None
-        self.state_extra = 0                       # adaptive: rho (2) + W (1) + imprint (K) state channels
+        self.state_extra = 0                       # LK: 3+K spatial channels; lock: 4 compact node scalars
         self.collision_kind = collision
         self.wall_mode, self.bounce_mode, self.wall_band = wall_mode, bounce_mode, wall_band
         self.bounce, self.rigid_K, self.rigid_eps, self.rigid_eps_rel = bounce, rigid_K, rigid_eps, rigid_eps_rel
@@ -96,8 +100,10 @@ class KineticWM(nn.Module):
                 if collision not in ("none", "bounce"):
                     raise ValueError("adaptive supports --collision none or bounce")
                 self.cell = AdaptiveNodeCell(in_ch, C, world, window, num_v=V, spacing=node_spacing,
-                                             imprint_k=imprint_k, gamma=imprint_gamma)
-                self.state_extra = self.cell.extra + self.cell.K_imp
+                                             imprint_k=imprint_k, gamma=imprint_gamma, node_update=node_update)
+                # LockState stores these four scalars compactly and its K-channel
+                # snapshot separately, never repeated over V or the world map.
+                self.state_extra = self.cell.extra + (self.cell.K_imp if node_update == "lk" else 0)
             else:
                 self.cell = KineticCell(in_ch, C, world, window, num_v=V)
         self.num_v = self.cell.num_v
@@ -145,7 +151,7 @@ class KineticWM(nn.Module):
 
     def node_velocity(self, h):
         """Per-pixel velocity of every node on the window: [B,V,2,win,win]."""
-        B, V = h.shape[:2]
+        B, V = features(h).shape[:2]
         nodes = self.nodes()
         nv = (nodes if nodes.dim() == 3 else nodes[None].expand(B, -1, -1))[..., None, None]   # [B,V,2,1,1]
         if self.kind == "adaptive":                                            # per-sample adaptive nodes
@@ -153,7 +159,7 @@ class KineticWM(nn.Module):
         return nv.expand(-1, -1, -1, self.window, self.window)
 
     def decode(self, h, aux=None):
-        hw = h[:, :, :self.C, :self.window, :self.window]                    # [B,V,C,win,win]
+        hw = features(h)[:, :, :self.C, :self.window, :self.window]          # [B,V,C,win,win]
         mx = hw.amax(1)
         if self.readout == "max":
             z = mx
@@ -176,7 +182,7 @@ class KineticWM(nn.Module):
         return self.decoder_conv(z)
 
     # ------------------------------------------------------------------
-    def _step(self, frame, h, a, dt, wall):
+    def _step(self, frame, h, a, dt, wall, update_nodes=None):
         """One recurrence step. wall (ego frame of h) or None. Returns (h_new, wall_new)."""
         if self.kind == "flowm":
             return self.cell(frame, h, a, dt), wall
@@ -194,9 +200,13 @@ class KineticWM(nn.Module):
                 coll = lambda hh: bounce_back(hh, nodes, px, py, wall, self.bounce_mode)
         elif self.coll is not None:
             coll = self.coll
-        h_new = self.cell(frame, h, a, nodes, dt, coll)
+        if self.kind == "adaptive" and self.node_update == "lock":
+            h_new = self.cell(frame, h, a, nodes, dt, coll, update_nodes=update_nodes)
+        else:
+            h_new = self.cell(frame, h, a, nodes, dt, coll)
         if self._node_traj is not None and self.kind == "adaptive":
-            self._node_traj.append(self.cell.last_nodes)
+            self._node_traj.append((nodes[None].float() + self.cell.offsets(h_new)).detach()
+                                   if self.node_update == "lock" else self.cell.last_nodes)
         if wall is not None:
             wall = spectral_shift(wall, -a)                                   # static (nu=0) transport
             if self.wall_enc is not None:
@@ -208,13 +218,16 @@ class KineticWM(nn.Module):
         return h_new, wall
 
     def step(self, frame, h, a, dt, wall):
+        # Capture the phase before checkpointing: forward() restores the mutable
+        # legacy flag before backward recomputes the prediction steps.
+        update = self.cell.update_nodes if self.kind == "adaptive" and self.node_update == "lock" else None
         if self.grad_ckpt and self.training and torch.is_grad_enabled():
             if wall is None:
-                return ckpt.checkpoint(lambda f, hh, aa: self._step(f, hh, aa, dt, None),
+                return ckpt.checkpoint(lambda f, hh, aa: self._step(f, hh, aa, dt, None, update),
                                        frame, h, a, use_reentrant=False)
-            return ckpt.checkpoint(lambda f, hh, aa, ww: self._step(f, hh, aa, dt, ww),
+            return ckpt.checkpoint(lambda f, hh, aa, ww: self._step(f, hh, aa, dt, ww, update),
                                    frame, h, a, wall, use_reentrant=False)
-        return self._step(frame, h, a, dt, wall)
+        return self._step(frame, h, a, dt, wall, update)
 
     def forward(self, obs, actions_in, actions_out, target=None, tf_ratio=0.0, dt=1.0,
                 wall0=None, return_aux=False, nodes=None, return_states=None, record_nodes=False):
@@ -243,7 +256,10 @@ class KineticWM(nn.Module):
         B, T_in = obs.shape[:2]
         T_pred = actions_out.shape[1]
         dev = obs.device
-        h = obs.new_zeros(B, self.num_v, self.C + self.state_extra, self.world, self.world)
+        if self.kind == "adaptive" and self.node_update == "lock":
+            h = self.cell.initial_state(obs[:, 0])
+        else:
+            h = obs.new_zeros(B, self.num_v, self.C + self.state_extra, self.world, self.world)
         wall = None
         if self.collision_kind == "bounce":
             if self.wall_mode == "known":
@@ -256,7 +272,8 @@ class KineticWM(nn.Module):
         for t in range(T_in):
             h, wall = self.step(obs[:, t], h, actions_in[:, t], dt, wall)
             if t in keep:
-                states[t] = h.detach().float().clone()
+                states[t] = (LockState(*(x.detach().float().clone() for x in h))
+                             if isinstance(h, LockState) else h.detach().float().clone())
         prev = obs[:, -1]
         if self.kind == "adaptive" and not self.node_update_pred:
             self.cell.update_nodes = False
@@ -305,5 +322,6 @@ def build_model(args):
                      rigid_eps_rel=g("rigid_eps_rel", 0.05),
                      imprint_k=g("imprint_k", 8), imprint_gamma=g("imprint_gamma", 0.9),
                      node_update_pred=(g("node_update_pred", "on") == "on"),
+                     node_update=g("node_update", "lk"),
                      readout_rel=(g("readout_rel", "off") == "on"),
                      grad_ckpt=g("grad_ckpt", False))

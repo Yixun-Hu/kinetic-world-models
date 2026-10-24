@@ -131,6 +131,8 @@ def get_parser():
                         "(Galilean invariant); off: absolute node velocities, as in the reported results")
     g.add_argument("--imprint_k", type=int, default=8, help="adaptive: observation imprint channels per node")
     g.add_argument("--imprint_gamma", type=float, default=0.9, help="adaptive: imprint decay per step")
+    g.add_argument("--node_update", default="lk", choices=["lk", "lock"],
+                   help="adaptive: existing LK update or snapshot lock-then-refine update")
     g.add_argument("--node_update_pred", default="on", choices=["on", "off"],
                    help="adaptive: update the nodes also from the model's own predictions (on, as in the "
                         "reported results) or only from observations (off, experimental)")

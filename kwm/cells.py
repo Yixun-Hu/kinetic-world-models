@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 
 from .transport import stream, lk_displacement
+from .lock_nodes import LockState, lock_measurement
 
 
 def _fixed_projection(C, K, seed=1234):
@@ -107,12 +108,18 @@ class AdaptiveNodeCell(_Base):
       5. features as in KineticCell; the imprint decays and is overwritten on the observed window.
     With update_nodes = False (prediction phase, --node_update_pred off) rho, W and the imprints are frozen.
     self.last_nodes keeps nu_i(t+1) for diagnostics.
+
+    node_update='lock' uses LockState(features, nodes, snapshot, camera), with compact
+    fp32 nodes [B,V,4] (rho_x, rho_y, evidence, lock) and one fp32 observed
+    snapshot [B,K,win,win] and cumulative camera [B,2] per sample.
+    See lock_nodes.py and PR1_lock_nodes.md.
     """
 
     extra = 3
 
     def __init__(self, in_ch=1, C=64, world=50, window=32, num_v=25, spacing=1.0, imprint_k=8, gamma=0.9,
-                 lam_rel=1e-2, tr_rel=0.1, gate=0.6, bound=0.75, coh_rel=0.5, step_clip=0.3, s_init=1.0):
+                 lam_rel=1e-2, tr_rel=0.1, gate=0.6, bound=0.75, coh_rel=0.5, step_clip=0.3, s_init=1.0,
+                 node_update="lk"):
         super().__init__(in_ch, C, world, window)
         self.num_v, self.half, self.K_imp = num_v, spacing / 2, imprint_k
         self.gamma, self.lam_rel, self.tr_rel, self.gate = gamma, lam_rel, tr_rel, gate
@@ -121,12 +128,28 @@ class AdaptiveNodeCell(_Base):
         self.register_buffer("P", _fixed_projection(C, imprint_k))               # fixed, not trained
         self.last_nodes = None
         self.update_nodes = True
+        if node_update not in ("lk", "lock"):
+            raise ValueError("node_update must be lk or lock")
+        self.node_update = node_update
+        self.extra = 4 if node_update == "lock" else 3
+
+    def initial_state(self, observation):
+        B = observation.shape[0]
+        if self.node_update == "lk":
+            return observation.new_zeros(B, self.num_v, self.C + self.extra + self.K_imp, self.world, self.world)
+        return LockState(
+            observation.new_zeros(B, self.num_v, self.C, self.world, self.world),
+            observation.new_zeros(B, self.num_v, self.extra, dtype=torch.float32),
+            observation.new_zeros(B, self.K_imp, self.window, self.window, dtype=torch.float32),
+            observation.new_zeros(B, 2, dtype=torch.float32))
 
     def imprint(self, u):
         return torch.einsum("kc,bchw->bkhw", self.P.to(u.dtype), u)
 
     def offsets(self, h):
         """rho [B,V,2] from the spatially constant state channels."""
+        if isinstance(h, LockState):
+            return h.nodes[..., :2]
         return h[:, :, self.C:self.C + 2].float().mean((-2, -1))
 
     def bounce(self, h, nodes, perm_x, perm_y, wall, K=28):
@@ -135,6 +158,14 @@ class AdaptiveNodeCell(_Base):
         the reflected offset (rho_x -> -rho_x for x walls) and inherits the evidence W, when most of the source
         node's mass moved."""
         from .collision import rigid_bounce_back
+        if isinstance(h, LockState):
+            # Bounce node features and metadata; the shared camera-window
+            # snapshot is an observation, not node content to reflect.
+            fields = h.nodes[..., None, None].expand(-1, -1, -1, self.world, self.world)
+            packed = torch.cat([h.features.float(), fields], 2)
+            bounced = self.bounce(packed, nodes, perm_x, perm_y, wall, K)
+            st = bounced[:, :, self.C:, 0, 0]
+            return LockState(bounced[:, :, :self.C].to(h.features.dtype), st, h.snapshot, h.camera)
         C, E = self.C, self.extra
         nu = nodes[None].float() + self.offsets(h)
         content = torch.cat([h[:, :, :C], h[:, :, C + E:]], 2)
@@ -154,7 +185,10 @@ class AdaptiveNodeCell(_Base):
         fields = st[..., None, None].expand(B, V, E, H, W).to(h.dtype)
         return torch.cat([content[:, :, :C], fields, content[:, :, C:]], 2)
 
-    def forward(self, u_t, h_prev, action, nodes, dt=1.0, collision=None):
+    def forward(self, u_t, h_prev, action, nodes, dt=1.0, collision=None, update_nodes=None):
+        if self.node_update == "lock":
+            return self._forward_lock(u_t, h_prev, action, nodes, dt, collision,
+                                      self.update_nodes if update_nodes is None else update_nodes)
         C, K, E = self.C, self.K_imp, self.extra
         if collision is not None:                       # wall bounce on the adaptive nodes
             h_prev = collision(h_prev)
@@ -192,3 +226,35 @@ class AdaptiveNodeCell(_Base):
             m_new = torch.cat([torch.cat([pu.float()[:, None].expand(B, V, K, win, win), m_new[:, :, :, :win, win:]], 4),
                                m_new[:, :, :, win:]], 3)
         return torch.cat([h_new, fields.to(h_new.dtype), m_new.to(h_new.dtype)], 2)
+
+    def _forward_lock(self, u_t, h_prev, action, nodes, dt, collision, update_nodes):
+        if collision is not None:
+            h_prev = collision(h_prev)
+        rho = self.offsets(h_prev)
+        with torch.autocast(device_type=u_t.device.type, enabled=False):
+            nu = nodes[None].float() + rho
+            feat = stream(h_prev.features, nu, action.float(), dt)
+        u = self.conv_u(u_t)
+        if update_nodes:
+            with torch.autocast(device_type=u_t.device.type, enabled=False):
+                pu = self.imprint(u.float())
+                # Reproduce the gate's fp32 cumulative-camera subtraction.
+                # Using action directly is algebraically equal, but small
+                # rounding differences can flip discrete clustering decisions.
+                camera = h_prev.camera + action.float()
+                camera_delta = camera - h_prev.camera
+                delta, evidence, locked = lock_measurement(
+                    h_prev.snapshot, pu, nu, nodes, camera_delta, self.world, dt,
+                    self.lam_rel, self.tr_rel, self.gate, self.coh_rel, self.bound)
+                W_new = h_prev.nodes[..., 2:3] + evidence[..., None]
+                gain = evidence[..., None] / W_new.clamp_min(1e-6)
+                # Match the gate's velocity -> residual arithmetic at dt=1.
+                residual = (nu + delta / dt) - nu
+                step = (self.n_s * gain * residual).clamp(-self.step_clip, self.step_clip)
+                rho_new = (nu - nodes[None].float() + step).clamp(-self.bound, self.bound)
+                state = torch.cat([rho_new, W_new, locked[..., None]], -1)
+        else:
+            state, pu, camera = h_prev.nodes, h_prev.snapshot, h_prev.camera
+        # Use the existing feature recurrence, independent of estimator state.
+        h_new = self.act(self.lift(u_t, self.num_v) + self.mix(feat))
+        return LockState(h_new, state, pu, camera)
