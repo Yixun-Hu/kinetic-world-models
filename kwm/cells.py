@@ -16,8 +16,9 @@ import torch
 import torch.nn as nn
 
 from .transport import stream, lk_displacement
-from .lock_nodes import (LockState, lock_measurement, NODE_DIM, CORR, TIME, MT,
-                         acceleration_fit, accumulate_acceleration, corrected_offsets, transport_velocity)
+from .lock_nodes import (LockState, lock_measurement, NODE_DIM, CORR, TIME, MZ, CTZ, CZZ,
+                         acceleration_fit, accumulate_acceleration, corrected_offsets, transport_velocity,
+                         fit_correction)
 
 
 def _fixed_projection(C, K, seed=1234):
@@ -123,7 +124,7 @@ class AdaptiveNodeCell(_Base):
 
     def __init__(self, in_ch=1, C=64, world=50, window=32, num_v=25, spacing=1.0, imprint_k=8, gamma=0.9,
                  lam_rel=1e-2, tr_rel=0.1, gate=0.6, bound=0.75, coh_rel=0.5, step_clip=0.3, s_init=1.0,
-                 node_update="lk", order=1, accel_kappa=9., accel_var_inflation=4.,
+                 node_update="lk", order=1, accel_kappa=4.,
                  nu_forget=1., pred_shrink="none"):
         super().__init__(in_ch, C, world, window)
         self.num_v, self.half, self.K_imp = num_v, spacing / 2, imprint_k
@@ -141,10 +142,10 @@ class AdaptiveNodeCell(_Base):
             raise ValueError("nu_forget must be in (0,1]; pred_shrink must be none or learned")
         if node_update != "lock" and (nu_forget != 1 or pred_shrink != "none"):
             raise ValueError("nu_forget and pred_shrink require --node_update lock")
-        if accel_kappa < 0 or math.isnan(accel_kappa) or not (0 < accel_var_inflation < float('inf')):
+        if accel_kappa < 0 or math.isnan(accel_kappa):
             raise ValueError("invalid acceleration gate parameters")
         self.node_update, self.order = node_update, order
-        self.accel_kappa, self.accel_var_inflation = accel_kappa, accel_var_inflation
+        self.accel_kappa = accel_kappa
         self.nu_forget, self.pred_shrink = nu_forget, pred_shrink
         if pred_shrink == "learned":
             self.shrink_logit = nn.Parameter(torch.tensor(math.log(.999 / .001)))
@@ -254,8 +255,8 @@ class AdaptiveNodeCell(_Base):
     def lock_update(self, previous, pu, state, action, nodes, dt=1., update_nodes=True, prediction=False):
         """Production estimator, shared with the CPU gate harness (no feature recurrence)."""
         # PR1 mean and measurement arithmetic is deliberately kept separate from
-        # the additive acceleration correction. Prediction consumes the same
-        # measurements as PR1; only its carried correction advances.
+        # fit correction. Prediction may update the mean, but always blends it
+        # with the frozen fit evaluated at the current time (no additive drift).
         nu = nodes[None].float() + state[..., :2]
         if update_nodes:
             measurement = lock_measurement(
@@ -282,13 +283,14 @@ class AdaptiveNodeCell(_Base):
                 # and transport_velocity represents the mean over [t,t+dt].
                 fitted = accumulate_acceleration(state, nu + delta / dt, evidence,
                                                   state[..., TIME] - dt / 2, locked, measurement[3])
-                slope, gate, _, _ = acceleration_fit(fitted, self.accel_kappa, self.accel_var_inflation)
-                fitted[..., CORR] = gate[..., None] * slope * (state[..., TIME] - fitted[..., MT])[..., None]
+                fitted[..., CORR] = fit_correction(fitted, nodes[None].float() + prefix[..., :2],
+                                                   state[..., TIME], self.accel_kappa)
                 fitted[..., TIME] = state[..., TIME] + dt
                 extra = fitted[..., 4:]
             elif prediction:
-                slope, gate, _, _ = acceleration_fit(state, self.accel_kappa, self.accel_var_inflation)
-                extra = torch.cat([state[..., 4:15], state[..., CORR] + gate[..., None] * slope * dt], -1)
+                correction = fit_correction(state, nodes[None].float() + prefix[..., :2],
+                                             state[..., TIME], self.accel_kappa)
+                extra = torch.cat([state[..., 4:14], (state[..., TIME] + dt)[..., None], correction], -1)
         return torch.cat([prefix, extra], -1)
 
     def prediction_state(self, state, nodes):
@@ -296,7 +298,14 @@ class AdaptiveNodeCell(_Base):
             return state
         factor = self.shrink_logit.sigmoid()
         rho = ((nodes[None].float() + state[..., :2]) * factor - nodes[None].float()).clamp(-self.bound, self.bound)
-        return torch.cat([rho, state[..., 2:15], state[..., CORR] * factor], -1)
+        out = torch.cat([rho, state[..., 2:15], state[..., CORR] * factor], -1)
+        if self.order == 2:
+            # Shrink the whole frozen velocity line, including its slope;
+            # scale residual power too, preserving the significance gate.
+            out[..., MZ] = state[..., MZ] * factor
+            out[..., CTZ] = state[..., CTZ] * factor
+            out[..., CZZ] = state[..., CZZ] * factor.square()
+        return out
 
     def _forward_lock(self, u_t, h_prev, action, nodes, dt, collision, update_nodes, prediction):
         if collision is not None:
@@ -305,7 +314,7 @@ class AdaptiveNodeCell(_Base):
         with torch.autocast(device_type=u_t.device.type, enabled=False):
             nu = nodes[None].float() + state[..., :2]
             if self.order == 2:
-                nu = transport_velocity(state, nodes, dt, self.accel_kappa, self.accel_var_inflation, self.bound)
+                nu = transport_velocity(state, nodes, dt, self.accel_kappa, self.bound)
             feat = stream(h_prev.features, nu, action.float(), dt)
         pu = h_prev.snapshot
         if update_nodes:

@@ -171,11 +171,10 @@ def get_parser():
     g.add_argument("--node_update", default="lk", choices=["lk", "lock"],
                    help="adaptive: existing LK update or snapshot lock-then-refine update")
     g.add_argument("--node_update_pred", default="on", choices=["on", "off"],
-                   help="adaptive: update the nodes also from the model's own predictions (on, as in the "
-                        "reported results) or only from observations (off, experimental)")
-    g.add_argument("--order", type=int, choices=[1, 2], default=1, help="lock velocity order")
-    g.add_argument("--accel_kappa", type=float, default=9., help="acceleration gate strength; inf closes it")
-    g.add_argument("--accel_var_inflation", type=float, default=4., help="empirical slope-variance inflation")
+                   help="adaptive: on consumes generated frames; off freezes measurements "
+                        "(primary setting for order 2)")
+    g.add_argument("--order", type=int, choices=[1, 2], default=1, help="lock velocity order; 2 is experimental")
+    g.add_argument("--accel_kappa", type=float, default=4., help="2D trace gate strength (4 or 9); inf closes it")
     g.add_argument("--nu_forget", type=float, default=1., help="lock evidence retention per update, (0,1]")
     g.add_argument("--pred_shrink", choices=["learned", "none"], default="none", help="learned prediction velocity shrink")
     g.add_argument("--dec_input", default="flowm", choices=["flowm", "zero"],

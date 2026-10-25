@@ -12,7 +12,7 @@ For the adaptive-node model the boost moves every node velocity nu_i = lattice_i
 import torch
 
 from .transport import spectral_shift
-from .lock_nodes import LockState, features, MZ
+from .lock_nodes import LockState, features, MZ, MODE
 
 
 def _lattice_index(nodes, spacing):
@@ -118,6 +118,12 @@ def boost_transform_nodes(h, nodes, spacing, C, nu_hat, bound, extra=3):
     num = torch.zeros_like(st).scatter_add_(1, idx[..., None].expand_as(st), st * w[..., None])
     den = torch.zeros_like(w).scatter_add_(1, idx, w)
     st_new = num / den.clamp_min(1e-12)[..., None]
+    if E > MODE:
+        # Split labels are categorical. A mass vote preserves integer labels
+        # through off-lattice merges; argmax deterministically breaks ties.
+        votes = torch.stack([torch.zeros_like(w).scatter_add_(1, idx, w * (st[..., MODE] == mode))
+                             for mode in range(3)], -1)
+        st_new[..., MODE] = votes.argmax(-1).float()
     out = torch.cat([out_c[:, :, :C], st_new[..., None, None].expand(B, V, E, H, W).to(h.dtype), out_c[:, :, C:]], 2)
     tmask = torch.zeros(B, V, dtype=torch.bool, device=h.device)
     tmask.scatter_(1, idx, valid)

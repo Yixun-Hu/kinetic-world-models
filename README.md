@@ -143,12 +143,19 @@ license for the equivalence test. Everything else is MIT licensed, see
 
 Opt-in acceleration experiments are described in [PR2](docs/PR2_order2.md).
 
-- `--accel A`: maximum acceleration magnitude in px/frame²; default `0` disables it; incompatible with walls.
+- `--accel A`: maximum acceleration magnitude in px/time-unit²; default `0` disables it; incompatible with walls; acceleration scenes use the `vel1` tag.
 - `--accel_zero_p P`: proposal probability of zero acceleration, default `0.3`.
 - `--accel_min A`: smallest nonzero proposed acceleration, default `0.002`.
 - `--accel_horizon H`: speed-bound horizon in time units, default `180`.
 - `--order {1,2}`: node motion order, default `1`; order 2 requires adaptive lock nodes; eval can override it.
-- `--accel_kappa K`: gate strength, default `9`; `inf` closes the gate; eval can override it.
-- `--accel_var_inflation I`: slope-variance inflation, default `4`; the requested null calibration remains above 2%.
+- `--accel_kappa K`: 2-D trace gate strength, default `4`; `9` is available and `inf` closes the gate; eval can override it. Gates require n_eff ≥ 4.
 - `--nu_forget F`: evidence retention per lock update, default `1`; eval can override it.
 - `--pred_shrink {learned,none}`: prediction velocity shrinkage, default `none`; learned sigmoid starts at `0.999`.
+
+Use `--node_update_pred off` for the primary order-2 comparison. The existing
+`on` default blends the frozen fit with the updated running mean at each time.
+The [CPU gate](docs/GATE_order2.md) requires a null rate below 2% and at least
+10% lower displacement proxy mean than the best forgetting setting. Order 2
+remains experimental. The current result is **NO-GO**: selected order 2 has
+proxy mean 5.96454 px versus 5.94696 px for best F=0.9, about 0.30% worse.
+Null rates are 0.396% at κ=9 and 2.074% at default κ=4; the latter misses the 2% target.

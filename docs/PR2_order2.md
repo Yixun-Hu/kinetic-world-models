@@ -1,292 +1,204 @@
 # Second-order lock nodes and K-accel
 
-`--order 2` adds a detached acceleration estimate to the snapshot lock estimator.
-It requires `--model adaptive --node_update lock`. The default remains order 1;
-LK is unchanged. No forecasting training is included in this PR. The specified
-2% null calibration target was **not met** by any of the requested inflation
-values; the default of 4 is a conservative fallback, not a successful calibration.
+`--order 2` is an experimental opt-in for `--model adaptive --node_update lock`.
+Order 1 remains the default; both LK and lock retain bit-identical outputs,
+states and gradients against the frozen pre-change cell and model references.
+The CPU result is **NO-GO**: selected order 2 has displacement proxy mean
+5.96454 px, versus 5.94696 px for best forgetting (F=0.9), about 0.30% worse.
+At κ=9 the null rate is 0.396%, passing the 2% target; the default κ=4 has
+2.074% null and fails that target. The required displacement improvement is
+at least 10%. All sweep and calibration results
+are in [GATE_order2.md](GATE_order2.md). No trained forecasting improvement is established.
 
-## State and estimator
+## Estimator and gate
 
-Both lock orders use `LockState(features, nodes, snapshot)` with 17 fp32 node
-columns. LK retains its original spatial state. The first four lock columns
-and their arithmetic retain the PR1 meaning. The additional columns remain
-zero for order 1.
+Both lock orders use `LockState(features, nodes, snapshot)`, with 17 fp32 node
+columns. The first four columns retain the original running offset, evidence,
+and lock bit. Order 1 leaves all additional columns zero.
 
 | Columns | Meaning |
 | --- | --- |
-| 0–1 | PR1 residual velocity rho |
-| 2 | PR1 cumulative evidence W |
-| 3 | Current lock bit |
-| 4 | Fit weight S_w |
-| 5 | Weighted mean measurement time t_bar |
-| 6 | Centred time moment C_tt = sum w(t−t_bar)² |
-| 7–8 | Weighted mean measured velocity z_bar |
-| 9–10 | Centred cross moment C_tz = sum w(t−t_bar)(z−z_bar) |
-| 11 | Sum of squared weights |
-| 12 | Centred velocity scatter C_zz = sum w||z−z_bar||² |
-| 13 | Selected split mode: 0 unsplit, 1 left, 2 right |
-| 14 | Next observation time, in time units |
-| 15–16 | Additive instantaneous velocity correction |
+| 0–3 | Running offset rho (2), evidence W, lock bit |
+| 4–6 | Fit weight S_w, weighted time t_bar, centred time moment C_tt |
+| 7–10 | Weighted velocity z_bar (2), centred cross moment C_tz (2) |
+| 11–12 | Sum of squared weights S_w2, centred velocity scatter C_zz (trace) |
+| 13 | Diagnostic split label: 0 unsplit, 1 left, 2 right |
+| 14 | Next frame timestamp, advanced during prediction too |
+| 15–16 | Correction relative to the current running mean |
 
-The nine fit columns are a centred, weighted Welford representation of the
-seven proposed raw sums plus squared weights and total velocity scatter. This
-avoids cancellation in fp32 and needs no stored history. A single scatter
-scalar suffices because the gate uses the trace of the 2D slope covariance.
-Mode, clock and two correction columns make recurrence replay explicit; frozen
-slopes and gates are recomputed from frozen sums instead of stored again.
-
-The PR1 measurement uses its original velocity nu_bar = lattice + rho. Its
-selected residual delta gives z = nu_bar + delta/dt; its selected evidence gives
-w. The PR1 update still uses its original gain, learned n_s, step clip and rho
-clip. The second-order sums consume detached z and w; neither n_s nor the gate
-scales the measured acceleration. Feature transport does not feed back into the
-snapshot encoder, so order-1 and order-2 estimator measurements on the same
-input frames are identical.
-
-At frame time t the new displacement measurement spans [t−dt,t]. Its timestamp
-is therefore t−dt/2. This is a deliberate half-step clarification of the proposed
-integer-index convention: shifting every fit timestamp by dt/2 leaves the slope
-unchanged, but the correction must use the physical measurement midpoint to
-predict v(t) and the mean velocity over [t,t+dt] consistently.
-
-With C_tt > 0, the slope is alpha_hat = C_tz/C_tt. The effective sample count is
-n_eff = S_w²/sum(w²). C_tt < 1e-6 or n_eff < 3 closes the gate and returns a zero
-slope. The empirical variance model is:
+The detached measured velocity is z = lattice + rho + delta/dt. Its timestamp
+is the midpoint of the measured interval. The learned PR1 scale n_s affects
+only the running-mean update, not the fitted acceleration. Weighted Welford
+updates avoid subtracting large raw moments and require no stored history.
 
 ```
+n_eff = S_w² / S_w2
+alpha_hat = C_tz / C_tt
 RSS = max(C_zz − dot(C_tz, alpha_hat), 0)
-s² = RSS / (S_w − 2 S_w/n_eff)
-Var(alpha_hat) = inflation × s²/C_tt       # trace over x and y
- g = clip(1 − kappa Var(alpha_hat)/||alpha_hat||², 0, 1)
+s² = RSS / (S_w (1 − 2/n_eff))
+Var(alpha_hat) = s² / C_tt × S_w2/S_w       # trace over x and y
+g = clip(1 − kappa Var(alpha_hat)/||alpha_hat||², 0, 1)
 ```
 
-Positive denominator guards avoid NaNs at empty/degenerate nodes. A zero slope
-closes the gate. `--accel_kappa inf` bypasses the fit and keeps the extra state
-zero, giving full state identity as well as closing the gate without inf×0. All fit
-statistics, variance, slope, gate and mode decisions are detached and fp32.
-The empirical residual model does not assume independent constant displacement
-noise: consecutive one-step measurements share frames, motivating the inflation
-sweep. That scalar correction does not remove association and convergence bias.
+This uses the review's allowed Kish approximation to the weighted sandwich,
+exact for equal weights. It is invariant to multiplying every evidence weight
+by a constant. With heterogeneous weights it approximates the time leverage;
+it is not a claim of exact heteroscedastic coverage under arbitrary association
+errors. The empirical null tests therefore remain necessary. Gates require
+n_eff ≥ 4 and weighted time variance C_tt/S_w ≥ 1e-6. Zero slopes close the gate.
+`--accel_kappa inf` bypasses fitting and preserves full order-1 state identity.
 
-## Motion, resets and prediction
+κ acts on the **2-D covariance trace**. With equal component variances, κ=9
+requires an acceleration norm above sqrt(18) ≈ 4.2 component standard errors;
+it does not mean three standard errors. The default is κ=4, with κ=9 available.
+Under the ideal isotropic Gaussian, known-variance null, the open probability
+is exp(−κ): approximately 1.8% and 0.012%, respectively. Estimated variance,
+small effective samples and association noise need not follow that ideal law.
 
-During observation, instantaneous velocity is
-nu(t) = nu_bar + g alpha_hat(t−t_bar). Each step transports features through
-nu(t) dt + 0.5 g alpha_hat dt². The effective instantaneous offset is clamped to
-the node's overlapping ±0.75 cell. The PR1 rho clamp is retained independently.
-`clamp_rate_obs` and `clamp_rate_pred` in model aux report the fraction of
-node-steps whose additive correction requests an instantaneous velocity outside
-that cell. The within-step acceleration term remains in the displacement.
+Variance inflation was tried at 1, 2 and 4 before review. It was the wrong fix:
+the original variance scaled inversely with pixel-evidence magnitude. Inflation
+could not repair that units error and has been removed from the CLI and sweep.
+The earlier MA(1) attribution was also incorrect. For displacement noise
+z_t = v + e_t − e_(t−1), the slope numerator telescopes; the white-noise plug-in
+**overestimates**, rather than underestimates, long-window slope variance
+(roughly by N/3). Persistent association errors can instead produce positive
+correlation. Remaining calibration limitations include those errors and small
+effective sample sizes.
 
-When the selected identity changes between consecutive two-mode splits, or a
-locked node becomes unlocked, its fit sums are cleared **before** the current
-measurement is added. A disappearing/reappearing split alone is not a mode
-switch. Split identities use the canonical principal-axis left/right ordering.
-The PR1 mean/evidence are not reset. Bounce transfers the original prefix,
-reflects rho, and discards the discontinuous acceleration fit/correction. The
-shared snapshot remains in the observation frame. On-lattice comoving boosts
-shift z_bar and the lattice velocity by u; centred moments, slope and correction
-remain invariant. Off-lattice node mergers retain the prior approximate merge
-policy and do not establish exact acceleration-fit equivariance.
+## Resets, motion and prediction
 
-Prediction freezes the final observation fit and gate:
+Before adding a measurement, clear the fit on lock loss or a measured velocity
+jump. A jump is ||z_t − z_hat_t|| > 6s, where z_hat_t is the old fit evaluated at
+the new measurement timestamp, and s is the residual trace scale above, floored
+at 1e-4 px/time-unit for roundoff. The test applies only after at least three
+effective measurements and only when the new measurement has positive weight.
+Principal-axis label changes do not reset the fit. The original running mean
+and its evidence are not reset.
 
-- `--node_update_pred off`: no new mean or snapshot measurements; the correction
-  advances by g alpha_hat dt each step.
-- `--node_update_pred on` (default): the PR1 running mean continues consuming the
-  model's generated input frames; the frozen correction also advances by
-  g alpha_hat dt. Prediction measurements never refit acceleration or trigger
-  fit resets.
+Instantaneous velocity uses the fit's own intercept:
 
-Away from clamps, fixed acceleration composes to nu tau + 0.5 alpha tau².
-Node trajectories, moment velocity diagnostics and `node_velocity_error` use the
-outgoing interval mean v(t)+0.5 g alpha_hat dt, matching the environment's vel[t].
-The instantaneous v(29) and the mean over [29,30] differ by a/2.
+```
+nu(t) = (1−g) nu_bar + g (z_bar + alpha_hat (t−t_bar))
+```
 
-When the gate is zero, explicit selection preserves the original arithmetic on
-velocity, including the lattice addition. The bit-identity tests compare both
-orders with κ=inf, including prediction on/off and checkpointed gradients.
-Checkpoint closures capture observation/prediction and node-update decisions;
-recording diagnostics runs without autograd side effects.
+An explicit zero-correction selection preserves the order-1 arithmetic at g=0.
+The instantaneous offset is clamped to the overlapping ±0.75 node cell; outgoing
+transport then uses nu(t) + 0.5 g alpha_hat dt. Diagnostics and velocity matching
+use this outgoing interval mean, matching the environment's `vel[t]` convention.
+Clamp rates count evidence-bearing node-steps, include the half-step acceleration
+term, and report order-1 offset saturation on the same denominator.
 
-Two controls are available on the lock path. `--nu_forget F` multiplies the PR1
-running evidence by F before an update; F=1 bypasses the multiplication.
-`--pred_shrink learned` multiplies velocity by sigmoid(theta) before each
-prediction transport, then applies the usual measurement update. One learned
-scalar is initialized with logit(0.999); `none` adds no parameter or operation.
-With order 2, the carried correction is shrunk too. These controls require
-separate trained comparisons to distinguish acceleration estimation from a
-prior toward slower motion.
+Prediction freezes the observation fit and gate:
 
-## Environment
+- **`--node_update_pred off` is the primary experimental setting.** The running
+  mean and snapshot freeze; the fit is evaluated at each new time.
+- `on` preserves the existing default for order-1 compatibility. The running
+  mean consumes generated frames, but each correction is recomputed as
+  g × (frozen fit extrapolation − current running mean). It never adds an
+  independently advancing correction on top of that updated mean.
 
-For each digit, propose v0 uniformly in [-vmax,vmax]², and propose zero
-acceleration with probability accel_zero_p. Otherwise draw a uniform direction
-and a log-uniform magnitude in [accel_min,accel]. Jointly reject and redraw
-**both** v0 and a until their velocities at times 0 and accel_horizon lie within
-the componentwise speed bound. Linear velocity makes those endpoint checks
-sufficient throughout the interval. Acceleration mode uses continuous v0 even
-if `--real_velocity` is omitted. Camera sampling still follows `--real_camera`.
+Neither prediction policy refits acceleration or triggers fit resets.
+`--nu_forget F` discounts the running evidence before each update; F=1 bypasses
+that multiplication. Order 2 + F fits the resulting measurement stream, without
+forgetting the fit itself. `--pred_shrink learned` scales the running velocity,
+correction and entire frozen fitted velocity line, including its acceleration;
+its sigmoid factor starts at 0.999. `none` adds no parameter or operation.
 
-Positions follow p0+v0 t+0.5 a t², wrapped on the world torus. Only acceleration
-mode evaluates this closed form; it uses float64 before wrapping and stores
-fp32 positions to keep long-horizon coordinate error below 1e-5 pixels. The
-non-acceleration incremental loop and RNG consumption are unchanged. The renderer
-is shared by the generator and ceiling script: Fourier placement, MAX digit
-composition, real camera shift, crop and [0,1] clamp.
+Bounce reflects the original prefix and clears the fit/correction. On-lattice
+boosts shift z_bar while retaining centred moments and acceleration. Off-lattice
+merges remain approximate; split labels use a mass-weighted categorical vote,
+not an arithmetic average.
 
-`digit_states.acc` is [B,n_digits,2], including all zeros when acceleration is
-disabled. `vel[t]` is v0+a(t+dt/2), the mean over the **outgoing** interval.
-The horizon is in time units, so dt=0.5 uses the same velocity/acceleration law.
-Subsampling adjusts interval-mean velocities to the longer interval. Acceleration
-with walls, a speed ring or random scene boosts is rejected because those modes
-would violate this simple bounded joint law. Explicit diagnostic boosts are
-applied after sampling and may exceed the original speed bound.
+## Environment and flags
 
-Default tags are unchanged. `_acc<A>` is appended only when A is nonzero;
-nondefault zero probability, minimum and horizon are appended only in that mode.
-Old self-described, acceleration-disabled caches retain their filenames and
-load after their original hash and normalized configuration are checked. Existing
-cached tensors and evaluation reductions are not rewritten. Source changes keep
-the PR5a warning behavior. Checkpoint flags and evaluation JSON record the new
-settings; eval can override order, kappa and forgetting without retraining.
+Acceleration mode proposes v0 uniformly in [-vmax,vmax]², zero acceleration
+with probability `accel_zero_p`, and otherwise a uniform direction with
+log-uniform magnitude in [`accel_min`, `accel`]. Jointly redraw v0 and a until
+velocities at time 0 and `accel_horizon` satisfy the componentwise speed bound.
+Those endpoint checks suffice for the full linear-velocity interval.
 
-## Flags
+Positions use p0 + v0 t + 0.5 a t² in float64 before torus wrapping; stored tensors
+are fp32. Rendering uses the existing Fourier placement, MAX composition,
+camera shift, crop and clamp. `vel[t]` is v0+a(t+dt/2), the outgoing interval
+mean; subsampling adjusts it to the longer interval. Units are pixels per time
+unit and pixels per time-unit², also at dt=0.5.
+
+Acceleration forces continuous initial velocities and therefore uses a `vel1`
+tag even without `--real_velocity`. `_acc<A>` and nondefault acceleration-law
+fields appear only when acceleration is enabled. Disabled-environment tensors,
+RNG consumption and tags remain unchanged. Walls, speed rings and random scene
+boosts are incompatible with this bounded acceleration law. The constant-velocity
+oracle is also rejected on K-accel; the rendering ceiling is a separate diagnostic.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--accel` | 0 | Maximum magnitude, px/time-unit²; 0 disables |
-| `--accel_zero_p` | 0.3 | Proposal zero probability |
-| `--accel_min` | 0.002 | Minimum nonzero magnitude |
-| `--accel_horizon` | 180 | Bounded-velocity horizon in time units |
-| `--order` | 1 | 2 enables acceleration on adaptive lock nodes |
-| `--accel_kappa` | 9 | Significance strength; inf closes the gate |
-| `--accel_var_inflation` | 4 | Conservative fallback; null target not met |
-| `--nu_forget` | 1 | Evidence retention, 0 < F ≤ 1 |
-| `--pred_shrink` | none | none or learned sigmoid velocity shrink |
-
-## Limitations
-
-The joint speed bound induces a strong deceleration correlation; a trained model
-may exploit that shortcut. Small accelerations can be undetectable over 30
-partially observed frames. Occlusion, changing associations and frequent unlocks
-can leave fewer than three effective measurements. Principal-axis mode labels
-can be unstable for nearly degenerate splits. Large acceleration eventually
-reaches the overlapping cell clamp, limiting long-horizon motion. A frozen
-prediction fit cannot recover from an incorrect observation-phase slope. The
-constant-velocity `oracle` model is undefined on K-accel and train/eval reject
-that combination; the rendering ceiling is a separate diagnostic.
-
-The gate's false-positive target remains unmet on the requested MNIST null set.
-A synthetic MA(1) measurement-noise test passes 2%, but it does not validate
-calibration under real image association errors. The controlled single-digit
-scene keeps the digit visible with camera velocity v0+U[-.25,.25]²; it tests
-recoverability under visibility, not the full random-camera distribution.
-No trained end-to-end improvement is established by these estimator tests.
+| `--accel` | 0 | Maximum magnitude, px/time-unit²; zero disables |
+| `--accel_zero_p` | 0.3 | Proposal probability of zero acceleration |
+| `--accel_min` | 0.002 | Minimum nonzero proposed magnitude |
+| `--accel_horizon` | 180 | Speed-bound horizon in time units |
+| `--order` | 1 | 2 enables the experimental acceleration fit |
+| `--accel_kappa` | 4 | 2-D trace threshold; 9 available; inf closes the gate |
+| `--nu_forget` | 1 | Running-evidence retention, 0 < F ≤ 1 |
+| `--pred_shrink` | none | none or learned sigmoid motion shrink |
 
 ## Realised law and rendering ceiling
 
-`scripts/accel_law.py`, seed 0, 400,000 accepted digits: acceptance
-0.725489, realised zero fraction 0.414147.
-The proposal zero probability is 0.3; rejection raises the realised fraction.
+Seed 0, 400,000 accepted digits: acceptance 0.725489; realised zero fraction
+0.414147 (proposal probability 0.3). Nonzero magnitude p10/median/p90/p99 is
+0.002347 / 0.004672 / 0.011854 / 0.018126 px/time-unit². Componentwise correlations
+between a and v0 are −0.170 / −0.355 / −0.699 in magnitude bins [0.002,0.004),
+[0.004,0.008), [0.008,0.02). The speed bound thus induces a deceleration prior.
 
-| Nonzero magnitude percentile | Magnitude (px/time-unit²) |
-| --- | --- |
-| 10 | 0.00234653 |
-| 50 | 0.00467181 |
-| 90 | 0.01185401 |
-| 99 | 0.01812620 |
+The ceiling uses 300 five-digit sequences, seed 1, MNIST test images, real camera
+and perfect positions at frame 29. MSE@H averages future frames 1 through H.
 
-| Magnitude bin | corr(a_k, v0_k), pooled x/y |
-| --- | --- |
-| [0.002, 0.004) | -0.170013 |
-| [0.004, 0.008) | -0.354601 |
-| [0.008, 0.02) | -0.699363 |
-
-| Horizon tau | Median 0.5 × magnitude × tau², all digits | Nonzero digits |
-| --- | --- | --- |
-| 20 | 0.5060 px | 0.9344 px |
-| 50 | 3.1625 px | 5.8398 px |
-| 150 | 28.4625 px | 52.5578 px |
-
-The ceiling uses 300 sequences × 5 MNIST test digits, seed 1, real camera,
-and the production MAX renderer. Positions at frame 29 are known perfectly;
-MSE@H averages frames 30 through 29+H. Values include sequence-level standard
-errors; this is an independent Torch draw from the planning script's NumPy draw.
-
-| Order-1 extrapolation velocity / baseline | MSE@20 ± SE | MSE@50 ± SE |
+| Extrapolation / baseline | MSE@20 ± SE | MSE@50 ± SE |
 | --- | --- | --- |
 | Mid-observation v(14.5) | 0.030259 ± 0.001093 | 0.072647 ± 0.001897 |
 | Instantaneous v(29) | 0.007597 ± 0.000365 | 0.047950 ± 0.001359 |
 | Forward difference p(30)−p(29) | 0.006875 ± 0.000335 | 0.046867 ± 0.001334 |
 | Observed backward difference p(29)−p(28) | 0.008337 ± 0.000395 | 0.049015 ± 0.001384 |
 | Repeat last observed frame | 0.226564 ± 0.002819 | 0.230396 ± 0.002660 |
-| Zero frame (planning reference “still”) | 0.156261 ± 0.002053 | 0.156718 ± 0.001734 |
+| Zero frame | 0.156261 ± 0.002053 | 0.156718 ± 0.001734 |
 
-The planning reference's “last finite difference” used the first future position,
-and its “still frame” was actually zero. Both reference definitions and the
-observable backward difference/true last-frame baseline are reported explicitly.
-The independent ceiling draw gives lower point estimates than the planning
-reference. This 1,500-digit ceiling draw has zero fraction 0.442667, compared
-with 0.414147 in the 400,000-digit law check, which can contribute to its lower
-MSE. The table reports sampling uncertainty; the law statistics agree closely.
-Raw results are in [accel_law.json](../results/order2_gate/accel_law.json).
+Raw law and ceiling results: [accel_law.json](../results/order2_gate/accel_law.json).
 
-## Gate harness results
+## CPU gate and limits
 
-100 sequences, seed 777, batches of two, frozen C=32/K=8 encoder, seed 0.
-Hungarian matching assigns all digits before the last-ten-frame visibility filter.
-The complete calibration and detection table is in [GATE_order2.md](GATE_order2.md);
-raw results are in [results/order2_gate](../results/order2_gate/).
+The gate uses 100 sequences per five-digit dataset, seed 777, a frozen C32/K8
+encoder, F ∈ {0.6,0.7,0.8,0.9,0.95} and κ ∈ {4,9}. All arms share a baseline
+Hungarian assignment among evidence-bearing nodes. The displacement proxy is
+the mean Euclidean displacement error at τ=20 and 50, averaged equally over
+horizons, using each final node's velocity and gated acceleration. It does not
+include future clamps or image rendering. The null tables report both the
+all-evidence and n_eff-eligible denominators and the n_eff distribution.
 
-At κ=9, null node-step open rates for inflation 1/2/4 are 3.628% / 2.963% / 2.161%.
-None is below 2%; inflation 4 is the most conservative allowed fallback.
-Its frame-29 null rate is 2.960%. No extra gate guard was added to force a pass.
+The separate paired single-digit ensemble uses 50 seeds, a fast C2/K2 encoder
+(world32/window24), and a camera tracking v0 plus uniform jitter. It selects the
+highest-evidence node without using truth. Its zero-acceleration twin has 0/50
+false positives at either κ; a=(0.004,0) detection is 50/50 at κ=4 and 47/50 at
+κ=9. This easier scene is not the five-digit random-camera distribution, and
+50 null seeds cannot establish a population false-positive rate below 2%.
 
-| Estimator | Matched median velocity error at v(29.5) | Mean |
-| --- | --- | --- |
-| order1 | 0.060391 | 0.112824 |
-| order2 | 0.058931 | 0.112322 |
-| order1_F0.9 | 0.046026 | 0.101751 |
-| order1_F0.95 | 0.052192 | 0.107232 |
+The go/no-go criterion is **K-real null node-step rate < 2% and standalone order 2
+at least 10% better than the best F on displacement proxy mean**. It is not met.
+The κ=9 null rate is 0.396% over evidence-bearing node-steps and 1.149% among
+n_eff-eligible node-steps. With F=0.9 these rates are 0.566% and 1.667%.
+Default κ=4 gives 2.074% (eligible 6.027%), or 2.524% (eligible 7.438%) with F=0.9.
 
-| Acceleration magnitude bin | Assigned visible digits | Gate open at frame 29 |
-| --- | --- | --- |
-| [0, 1e-07) | 224 | 4.464% |
-| [0.002, 0.004) | 97 | 10.309% |
-| [0.004, 0.008) | 100 | 1.000% |
-| [0.008, 0.02) | 79 | 12.658% |
+| Arm | Median velocity error | Mean displacement @20 | @50 | Proxy mean |
+| --- | --- | --- | --- | --- |
+| Order 1 | 0.060391 | 2.74983 | 9.19514 | 5.97248 |
+| Best F = 0.9 | 0.050203 | 2.75338 | 9.14054 | 5.94696 |
+| Order 2, κ=4 (default) | 0.058527 | 2.78613 | 9.48371 | 6.13492 |
+| Order 2, κ=9 | 0.060391 | 2.74616 | 9.18292 | 5.96454 |
+| Order 2 + F=0.9, κ=9 | 0.050215 | 2.80049 | 9.39653 | 6.09851 |
 
-The controlled one-digit scene with a=(.004,0) has velocity error
-0.00307922, acceleration error 0.00071728,
-and gate 0.972892. This yields the fast regression tolerances of
-0.0034 px/frame for velocity and 0.00079 px/frame² for acceleration (10% margin).
-
-The completed production-data run accounts for 653.59 seconds
-of single-thread CPU wall time, including the K-real calibration.
-The order-2 matched median improves slightly over
-order 1 here; both forgetting controls perform better. Detection is sparse and
-nonmonotonic across acceleration bins. These results do not establish robust
-acceleration detection or improved trained predictions.
-
-## Validation
-
-CPU only, Python 3.12 / PyTorch 2.9.0, one OMP/OpenBLAS thread:
-
-| Command / scope | Result | Runtime |
-| --- | --- | --- |
-| `python -m pytest -q` | 187 passed, 3 slow cases skipped | 67.71 s |
-| `KWM_SLOW=1 python -m pytest -q` | 190 passed | 170.06 s |
-| Fast `tests/test_order2.py` | 30 passed, 1 slow case skipped | 6.93 s |
-
-Both full suites emit the existing dependency deprecation warning. Frozen
-references come from integration revision `0c1198a048b4c0d7db310552efa2112bc4dfd9db`.
-Tests cover disabled-environment tensors, both PR1 cells and their input/parameter
-gradients, full state/output/gradient identity with κ=inf, empirical weighted
-variance, synthetic MA(1) null noise, controlled image acceleration recovery,
-transport composition, both prediction policies, checkpoint replay, boosts,
-bounce resets, fractional time, clamp rates, evaluation overrides and old cache
-compatibility. The slow acceleration regression checks the first 12 sequences
-against the published 100-sequence harness output. The panorama helper also
-passes order-2 prediction on/off parity after a preceding fractional-time setting.
+At κ=9, detection in the three nonzero acceleration bins is 0%, 2%, 0%
+(97, 100, 79 assigned digits); at κ=4 it is 0%, 4%, 5.06%. Final K-accel n_eff
+has p10/median/p90 of 1.15/4.31/9.73; 53.36% of nodes reach the floor of four.
+Order 2 + best F has median n_eff 4.24. The full null and detection tables,
+including both κ values, are in [GATE_order2.md](GATE_order2.md).
+Any future GPU comparison should first evaluate these estimator overrides on
+order-1-trained checkpoints with prediction updates off. An order-2 training
+campaign is not justified by estimator diagnostics alone.

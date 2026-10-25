@@ -36,7 +36,7 @@ import torch.nn as nn
 import torch.utils.checkpoint as ckpt
 
 from .cells import FloWMCell, KineticCell, AdaptiveNodeCell
-from .lock_nodes import LockState, features, CORR, transport_velocity
+from .lock_nodes import LockState, features, transport_velocity, clamp_mask
 from .collision import (lattice_nodes, reflection_perms, bounce_back, rigid_bounce_back,
                         known_wall_field, WallEncoder, VMixing, MLPCollision)
 from .transport import spectral_shift
@@ -59,7 +59,7 @@ class KineticWM(nn.Module):
                  dec_input="flowm", beta_init=10.0, grad_ckpt=False,
                  n_digits=5, imprint_k=8, imprint_gamma=0.9,
                  node_update_pred=True, readout_rel=False, node_update="lk", order=1,
-                 accel_kappa=9., accel_var_inflation=4., nu_forget=1., pred_shrink="none"):
+                 accel_kappa=4., nu_forget=1., pred_shrink="none"):
         super().__init__()
         if kind not in MODELS:
             raise ValueError(f"model must be one of {MODELS}")
@@ -106,7 +106,7 @@ class KineticWM(nn.Module):
                     raise ValueError("adaptive supports --collision none or bounce")
                 self.cell = AdaptiveNodeCell(in_ch, C, world, window, num_v=V, spacing=node_spacing,
                                              imprint_k=imprint_k, gamma=imprint_gamma, node_update=node_update,
-                                             order=order, accel_kappa=accel_kappa, accel_var_inflation=accel_var_inflation,
+                                             order=order, accel_kappa=accel_kappa,
                                              nu_forget=nu_forget, pred_shrink=pred_shrink)
                 self.state_extra = self.cell.extra + self.cell.K_imp if node_update == "lk" else 0
             else:
@@ -231,7 +231,7 @@ class KineticWM(nn.Module):
         """Outgoing interval-mean velocity, matching env.digit_states.vel."""
         if self.kind == "adaptive" and self.order == 2:
             return transport_velocity(h.nodes, self.nodes(), dt, self.cell.accel_kappa,
-                                      self.cell.accel_var_inflation, self.cell.bound)
+                                      self.cell.bound)
         return self.nodes()[None].float() + self.cell.offsets(h)
 
     def step(self, frame, h, a, dt, wall, prediction=False):
@@ -285,9 +285,13 @@ class KineticWM(nn.Module):
                 wall = obs.new_zeros(B, 4, self.world, self.world)
         states = {}
         clamp_counts = [obs.new_zeros((), dtype=torch.float32), obs.new_zeros((), dtype=torch.float32)]
+        clamp_denominators = [obs.new_zeros((), dtype=torch.float32), obs.new_zeros((), dtype=torch.float32)]
         def count_clamps(state, phase):
-            if isinstance(state, LockState) and self.order == 2:
-                clamp_counts[phase] += ((state.nodes[..., :2] + state.nodes[..., CORR]).abs() > self.cell.bound).any(-1).float().sum()
+            if isinstance(state, LockState):
+                active = state.nodes[..., 2] > 1e-6
+                clamped = clamp_mask(state.nodes, dt, self.cell.accel_kappa, self.cell.bound, self.order)
+                clamp_counts[phase] += (active & clamped).float().sum()
+                clamp_denominators[phase] += active.float().sum()
 
         for t in range(T_in):
             h, wall = self.step(obs[:, t], h, actions_in[:, t], dt, wall)
@@ -318,8 +322,10 @@ class KineticWM(nn.Module):
         if return_aux:
             out = {k: torch.stack(v, 1) for k, v in aux.items()}
             if self.kind == "adaptive" and self.node_update == "lock":
-                out["clamp_rate_obs"] = clamp_counts[0] / max(1, B * self.num_v * T_in)
-                out["clamp_rate_pred"] = clamp_counts[1] / max(1, B * self.num_v * T_pred)
+                out["clamp_rate_obs"] = clamp_counts[0] / clamp_denominators[0].clamp_min(1)
+                out["clamp_rate_pred"] = clamp_counts[1] / clamp_denominators[1].clamp_min(1)
+                out["clamp_node_steps_obs"] = clamp_denominators[0]
+                out["clamp_node_steps_pred"] = clamp_denominators[1]
             if keep:
                 out["states"] = states
             return preds, out
@@ -348,7 +354,7 @@ def build_model(args):
                      imprint_k=g("imprint_k", 8), imprint_gamma=g("imprint_gamma", 0.9),
                      node_update_pred=(g("node_update_pred", "on") == "on"),
                      node_update=g("node_update", "lk"), order=g("order", 1),
-                     accel_kappa=g("accel_kappa", 9.), accel_var_inflation=g("accel_var_inflation", 4.),
+                     accel_kappa=g("accel_kappa", 4.),
                      nu_forget=g("nu_forget", 1.), pred_shrink=g("pred_shrink", "none"),
                      readout_rel=(g("readout_rel", "off") == "on"),
                      grad_ckpt=g("grad_ckpt", False))

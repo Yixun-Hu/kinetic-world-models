@@ -258,21 +258,32 @@ NODE_DIM = 17
 
 
 @torch.no_grad()
-def acceleration_fit(state, kappa=9., inflation=4.):
+def _fit_statistics(state):
+    """Centred fit and residual trace scale, also used by the jump detector."""
+    w, ctt = state[..., SW], state[..., CTT]
+    neff = w.square() / state[..., SW2].clamp_min(1e-20)
+    slope = state[..., CTZ] / ctt[..., None].clamp_min(1e-20)
+    rss = (state[..., CZZ] - (state[..., CTZ] * slope).sum(-1)).clamp_min(0)
+    dof = w * (1 - 2 / neff.clamp_min(1))
+    scatter = rss / dof.clamp_min(1e-20)
+    return slope, scatter, neff
+
+
+@torch.no_grad()
+def acceleration_fit(state, kappa=4.):
     """Return detached slope, scalar gate, trace Var(slope), n_eff.
 
     n_eff = (sum w)^2 / sum(w²); residual scatter has denominator
-    W - 2 W/n_eff. The trace of the 2D slope covariance is scatter/Ctt,
-    inflated for shared-frame displacement errors. No model scale n_s enters.
+    W - 2 W/n_eff. Multiply scatter/Ctt by sum(w²)/sum(w): the
+    weight-scale-invariant Kish sandwich approximation (exact for equal
+    weights). Gate only at n_eff >= 4. Kappa acts on the 2D covariance trace;
+    kappa=9 corresponds to sqrt(18), about 4.2 component standard errors.
     """
     w, ctt = state[..., SW], state[..., CTT]
-    neff = w.square() / state[..., SW2].clamp_min(1e-12)
-    valid = (neff >= 3) & (ctt >= 1e-6)
-    slope = state[..., CTZ] / ctt[..., None].clamp_min(1e-6)
+    slope, scatter, neff = _fit_statistics(state)
+    valid = (neff >= 4) & (ctt / w.clamp_min(1e-20) >= 1e-6)
+    variance = scatter * (state[..., SW2] / w.clamp_min(1e-20)) / ctt.clamp_min(1e-20)
     slope = torch.where(valid[..., None], slope, 0)
-    rss = (state[..., CZZ] - (state[..., CTZ] * slope).sum(-1)).clamp_min(0)
-    dof = w * (1 - 2 / neff.clamp_min(1))
-    variance = inflation * rss / dof.clamp_min(1e-6) / ctt.clamp_min(1e-6)
     if kappa == float('inf'):
         gate = torch.zeros_like(w)
     else:
@@ -284,15 +295,19 @@ def acceleration_fit(state, kappa=9., inflation=4.):
 
 @torch.no_grad()
 def accumulate_acceleration(state, z, weight, time, locked, mode):
-    """Detached weighted centred sums; reset on a split-mode or unlock jump.
+    """Reset on lock loss or a measured velocity jump, then consume z.
 
-    mode 0 = unsplit, 1/2 = canonical principal-axis left/right. Compare
-    consecutive split identities; disappearing/reappearing splits alone do
-    not constitute a switch. Reset before consuming the new measurement.
+    After >=3 effective measurements, a jump exceeds six times the fit's
+    residual trace scale (floor 1e-4 px/time-unit for roundoff). Compare z to
+    the old fit's prediction at this measurement's timestamp. Mode labels
+    are diagnostic only: principal-axis left/right changes are not jumps.
     """
     out = state.detach().float().clone()
-    switched = (state[..., MODE] > 0) & (mode > 0) & (state[..., MODE] != mode)
-    reset = switched | ((state[..., 3] > .5) & (locked < .5))
+    slope, scatter, neff = _fit_statistics(state)
+    predicted = state[..., MZ] + slope * (time - state[..., MT])[..., None]
+    jump = (z.detach() - predicted).norm(dim=-1) > 6 * scatter.clamp_min(1e-8).sqrt()
+    jump &= (neff >= 3) & (weight > 0) & (state[..., CTT] > 0)
+    reset = jump | ((state[..., 3] > .5) & (locked < .5))
     out[..., 4:13] = torch.where(reset[..., None], 0, out[..., 4:13])
     w0 = out[..., SW].clone()
     w = weight.detach().float()
@@ -318,13 +333,31 @@ def corrected_offsets(state, bound=.75):
     return torch.where(correction != 0, (rho + correction).clamp(-bound, bound), rho)
 
 
-def transport_velocity(state, lattice, dt, kappa=9., inflation=4., bound=.75):
+def fit_correction(state, mean_velocity, time, kappa=4.):
+    """Blend the running mean with the fit's own intercept at `time`."""
+    slope, gate, _, _ = acceleration_fit(state, kappa)
+    fitted = state[..., MZ] + slope * (time - state[..., MT])[..., None]
+    return torch.where(gate[..., None] > 0, gate[..., None] * (fitted - mean_velocity), 0)
+
+
+def clamp_mask(state, dt=1., kappa=4., bound=.75, order=2):
+    """Saturated/requested offsets, including outgoing half-step acceleration."""
+    rho = state[..., :2]
+    if order == 1:
+        return (rho.abs() >= bound).any(-1)
+    slope, gate, _, _ = acceleration_fit(state, kappa)
+    instant = rho + state[..., CORR]
+    outgoing = instant.clamp(-bound, bound) + .5 * gate[..., None] * slope * dt
+    return (instant.abs() >= bound).any(-1) | (outgoing.abs() >= bound).any(-1)
+
+
+def transport_velocity(state, lattice, dt, kappa=4., bound=.75):
     """Outgoing interval-mean velocity: v(t) + .5 gated_a dt.
 
     The stream operator multiplies this by dt. Disabled gates preserve every
     PR1 operation on velocity, including the lattice + rho addition.
     """
-    slope, gate, _, _ = acceleration_fit(state, kappa, inflation)
+    slope, gate, _, _ = acceleration_fit(state, kappa)
     nu = lattice[None].float() + corrected_offsets(state, bound)
     half = .5 * (gate[..., None] * slope) * dt
     return torch.where(half != 0, nu + half, nu)

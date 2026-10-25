@@ -169,22 +169,35 @@ CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 python -m pytes
 CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 KWM_SLOW=1 python -m pytest -q
 ```
 
-The gate writes `results/order2_gate/{null,detection,synthetic,summary}.json` and
-`docs/GATE_order2.md`. Its default setting is a documented conservative fallback:
-none of inflation 1, 2, or 4 passed the specified 2% null target at κ=9. The
-single-digit check keeps its digit visible using a real camera moving at v0 plus
-uniform jitter in [-0.25,0.25]²; the 100-sequence null/detection sets retain the
-standard random camera. `--reuse-null` reuses a compatible completed calibration;
-`--reuse` reuses calibration and detection and refreshes the single-digit check.
+The gate regenerates `results/order2_gate/{null,detection,synthetic,summary}.json`
+and `docs/GATE_order2.md`. It sweeps F={0.6,0.7,0.8,0.9,0.95} and κ={4,9},
+including order 2 + F, with prediction updates off. κ defaults to 4; 9 and inf
+remain available. The inflation flag and sweep have been removed.
+
+The report includes median velocity error, mean displacement error at τ=20/50,
+n_eff distributions and evidence-bearing clamp rates. All arms use a shared
+order-1 assignment among evidence-bearing nodes. Fits share measurement runs
+only when forgetting is identical. Null calibration runs at F=1 and the best F
+selected by displacement error, keeping the full harness below 30 CPU-minutes.
+There is no stale-result reuse mode.
+
+The paired synthetic ensemble uses 50 seeds (configurable with
+`--synthetic-seeds`, minimum 50), C2/K2, world32/window24, and the highest-evidence
+node. Its real camera moves at v0 plus uniform jitter in [-0.25,0.25]²;
+both a=0 and a=(0.004,0) are tested. The 100-sequence datasets use the standard
+five-digit random camera. The gate requires null <2% and at least 10% lower
+displacement proxy mean than the best F. The current result is **NO-GO**:
+selected order 2 scores 5.96454 px versus 5.94696 px for best F=0.9 (0.30% worse).
+Its κ=9 null rate is 0.396%; default κ=4 has 2.074% null and misses the 2% target.
 
 Example training and evaluation (not run for this PR):
 
 ```bash
-python -m kwm.train --model adaptive --node_update lock --order 2 \
+CUDA_VISIBLE_DEVICES="" python -m kwm.train --model adaptive --node_update lock --order 1 --node_update_pred off \
   --real_velocity --real_camera --accel .02 --out runs/order2_s0
-python -m kwm.eval --run runs/order2_s0 --ckpt last --test_seed 777
-python -m kwm.eval --run runs/order2_s0 --ckpt last --test_seed 777 \
+CUDA_VISIBLE_DEVICES="" python -m kwm.eval --run runs/order2_s0 --ckpt last --test_seed 777 --order 2 --accel_kappa 4
+CUDA_VISIBLE_DEVICES="" python -m kwm.eval --run runs/order2_s0 --ckpt last --test_seed 777 \
   --order 1 --nu_forget .95 --tag forget095
-python -m kwm.eval --run runs/order2_s0 --ckpt last --test_seed 777 \
+CUDA_VISIBLE_DEVICES="" python -m kwm.eval --run runs/order2_s0 --ckpt last --test_seed 777 --order 2 \
   --accel_kappa inf --tag gate_closed
 ```

@@ -74,7 +74,7 @@ class EnvConfig:
                 raise ValueError("accel does not support v_ring or scene_boost (bounded joint law)")
 
     def tag(self):
-        s = f"w{self.world}_vel{int(self.real_velocity)}_cam{int(self.real_camera)}_walls{int(self.walls)}"
+        s = f"w{self.world}_vel{int(self.real_velocity or self.accel > 0)}_cam{int(self.real_camera)}_walls{int(self.walls)}"
         if self.odometry_noise or self.odometry_bias:
             s += f"_odo{self.odometry_noise:g}-{self.odometry_bias:g}"
         if self.dt != 1.0:

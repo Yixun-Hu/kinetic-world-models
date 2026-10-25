@@ -28,42 +28,34 @@
     "accel_min": 0.002,
     "accel_horizon": 180.0
   },
-  "inflation": 4.0,
-  "calibration_passed": false,
-  "elapsed_seconds": 653.5879461537115,
-  "synthetic": {
-    "seed": 777,
-    "config": {
-      "world": 50,
-      "window": 32,
-      "n_digits": 1,
-      "real_velocity": true,
-      "real_camera": true,
-      "walls": false,
-      "odometry_noise": 0.0,
-      "odometry_bias": 0.0,
-      "vmax": 2.0,
-      "amax": 10.0,
-      "dt": 1.0,
-      "v_ring": 0.0,
-      "scene_boost": 0.0,
-      "bounce_rule": "bbox",
-      "accel": 0.004,
-      "accel_zero_p": 0.3,
-      "accel_min": 0.002,
-      "accel_horizon": 180.0
-    },
-    "inflation": 4.0,
+  "variance": "Kish sandwich: residual scatter / Ctt * sum(w^2)/sum(w)",
+  "jump_sigma": 6.0,
+  "gate_neff_floor": 4,
+  "prediction": "off",
+  "schema": 2,
+  "best_forgetting": "order1_F0.9",
+  "order2": {
+    "name": "order2_k9",
     "kappa": 9.0,
-    "camera": "v0 + U[-.25,.25]^2 per step; digit remains visible",
-    "node": 16,
-    "velocity_error": 0.003079222049564123,
-    "acceleration": [
-      0.003429035423323512,
-      0.00043415522668510675
-    ],
-    "acceleration_error": 0.0007172806654125452,
-    "gate": 0.9728919267654419,
-    "seconds": 1.529168717097491
-  }
+    "null_rate": 0.003956038039177656,
+    "improvement": -0.0029565207176849295
+  },
+  "order2_plus_forgetting": "order2_F0.9_k9",
+  "go": false,
+  "criterion": "K-real evidence-bearing null node-step rate < 2%; standalone order2 proxy mean <= 0.9 * best F",
+  "candidates": [
+    {
+      "name": "order2_k4",
+      "kappa": 4.0,
+      "null_rate": 0.020741339772939682,
+      "improvement": -0.031606914543259146
+    },
+    {
+      "name": "order2_k9",
+      "kappa": 9.0,
+      "null_rate": 0.003956038039177656,
+      "improvement": -0.0029565207176849295
+    }
+  ],
+  "elapsed_seconds": 1387.6292494437657
 }

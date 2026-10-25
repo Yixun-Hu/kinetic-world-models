@@ -329,8 +329,7 @@ def main(argv=None):
                test_seed=test_seed, provenance=provenance, ckpt_provenance=ckpt_provenance, sets={},
                node_update=model.node_update, node_update_pred=getattr(model, "node_update_pred", None),
                readout_rel=getattr(model, "readout_rel", None), order=model.order,
-               accel_kappa=("inf" if args.get("accel_kappa", 9.) == float('inf') else args.get("accel_kappa", 9.)),
-               accel_var_inflation=args.get("accel_var_inflation", 4.),
+               accel_kappa=("inf" if args.get("accel_kappa", 4.) == float('inf') else args.get("accel_kappa", 4.)),
                nu_forget=args.get("nu_forget", 1.), pred_shrink=args.get("pred_shrink", "none"))
     role = "selection" if test_seed == VAL_SEED else "heldout"
     cache_set = dict(seed=test_seed, mnist_split="test", role=role, n=n_val, t_obs=T_obs, t_pred=T_pred, chunk=50)
