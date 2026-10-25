@@ -22,6 +22,7 @@ import torch.nn.functional as F
 
 from .env import EnvConfig, make_batch
 from .model import MODELS, COLLISIONS, build_model, count_params, make_wall0, oracle_nodes_from
+from .provenance import source_hashes, env_fingerprint
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VAL_SEED = 12345
@@ -50,13 +51,14 @@ def env_cfg_from_args(a, dt=1.0, split="train"):
     return EnvConfig(**kw)
 
 
-def val_cache(cfg, n, T_obs=VAL_T_OBS, T_pred=VAL_T_PRED, device="cpu", chunk=50):
-    """Load or build the fixed validation set. Frames are stored as float16 on CPU."""
+def val_cache(cfg, n, T_obs=VAL_T_OBS, T_pred=VAL_T_PRED, device="cpu", chunk=50, seed=VAL_SEED):
+    """Load or build a seeded set. The default validation path/content is unchanged."""
     os.makedirs(os.path.join(ROOT, "results"), exist_ok=True)
-    path = os.path.join(ROOT, "results", f"val_cache_{cfg.tag()}_n{n}_T{T_obs}+{T_pred}.pt")
+    sfx = f"_seed{seed}" if seed != VAL_SEED else ""
+    path = os.path.join(ROOT, "results", f"val_cache_{cfg.tag()}_n{n}_T{T_obs}+{T_pred}{sfx}.pt")
     if os.path.exists(path):
         return torch.load(path, weights_only=False)
-    gen = torch.Generator().manual_seed(VAL_SEED)
+    gen = torch.Generator().manual_seed(seed)
     parts = []
     for i in range(0, n, chunk):
         b = make_batch(min(chunk, n - i), T_obs, T_pred, cfg, device, gen, split="test")
@@ -199,6 +201,7 @@ def main(argv=None):
 
     cfg = env_cfg_from_args(a)                       # training distribution
     vcfg = env_cfg_from_args(a, split="val")         # quick-val / val cache distribution
+    provenance = dict(source_hashes(), env=env_fingerprint(cfg), validation_env=env_fingerprint(vcfg))
     model = build_model(vars(a)).to(device)
     n_params = count_params(model)
     opt = torch.optim.Adam(model.parameters(), lr=a.lr)
@@ -219,7 +222,8 @@ def main(argv=None):
         random.setstate(ck["py_rng"])
         print(f"[kwm] resumed from step {step0}")
     with open(os.path.join(a.out, "config.json"), "w") as f:
-        json.dump(dict(vars(a), n_params=n_params, num_v=model.num_v, env=cfg.to_dict(), device=device), f, indent=1)
+        json.dump(dict(vars(a), n_params=n_params, num_v=model.num_v, env=cfg.to_dict(), device=device,
+                       provenance=provenance), f, indent=1)
 
     cache = val_cache(vcfg, a.n_val, T_obs=a.t_obs, device=device)
     n_quick = min(a.val_n_quick, a.n_val)
@@ -233,7 +237,8 @@ def main(argv=None):
 
     def save(path, step):
         torch.save(dict(model=model.state_dict(), opt=opt.state_dict(), step=step, best=best, best150=best150,
-                        args=vars(a), gen_state=gen.get_state(), py_rng=random.getstate()), path)
+                        args=vars(a), gen_state=gen.get_state(), py_rng=random.getstate(),
+                        provenance=provenance), path)
 
     model.train()
     t_acc, d_acc, l_acc, n_acc = 0.0, 0.0, 0.0, 0

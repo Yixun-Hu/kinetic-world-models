@@ -86,6 +86,26 @@ python -m kwm.eval --run runs/adaptive --n_val 300 --equiv_boost
 
 `docs/REPRODUCE.md` lists the command for every table and figure.
 
+## Evaluation hygiene
+
+Training selects checkpoints on generated sequences with seed 12345. Evaluation
+uses those same sequences by default. Use `--test_seed 777` to evaluate on a
+separate set of generated sequences; results are saved as `eval_seed777.json`.
+Default cache paths and metric calculations are unchanged. Evaluation JSON now
+includes training/test seeds, per-sequence MSE, and source provenance.
+
+`scripts/report.py` summarizes multiple training seeds and computes paired tests
+and bootstrap intervals:
+
+```bash
+python -m kwm.eval --run runs/lk_s0 --ckpt last --test_seed 777
+python scripts/report.py --arm lk 'results/lk_s*/eval_seed777.json' \
+  --arm lock 'results/lock_s*/eval_seed777.json' --pairs lk:lock --holm
+```
+
+See [Evaluation hygiene](docs/EVAL_HYGIENE.md) for set definitions, JSON fields,
+manifest input, and statistical conventions.
+
 ## Layout
 
 ```
