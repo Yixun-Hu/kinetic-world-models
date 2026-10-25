@@ -28,9 +28,11 @@ wall interior (walls), walls drawn, then the whole world is phase-shifted by -ca
 and the top-left win x win crop is the observation; clamped to [0, 1].
 This deliberately does not use kwm.transport (independent code path).
 """
+import hashlib
 import math
 import os
 from dataclasses import dataclass, asdict
+from pathlib import Path
 
 import torch
 
@@ -76,6 +78,30 @@ class EnvConfig:
 
 # ---------------------------------------------------------------- MNIST ----
 _MNIST = {}
+_MNIST_SHA256 = {}
+
+
+def _mnist_source_sha256(ds):
+    """Hash the files torchvision read (images then labels), without downloading."""
+    try:
+        if ds._check_legacy_exist():
+            paths = [Path(ds.processed_folder) / ds.test_file]
+        else:
+            paths = [Path(ds.raw_folder) / name for name in
+                     ("t10k-images-idx3-ubyte", "t10k-labels-idx1-ubyte")]
+        digest = hashlib.sha256()
+        for path in paths:
+            with path.open("rb") as f:
+                for block in iter(lambda: f.read(1024 * 1024), b""):
+                    digest.update(block)
+        return digest.hexdigest()
+    except (AttributeError, OSError):
+        return None
+
+
+def mnist_sha256(split="test", root=DATA_ROOT):
+    """Fingerprint captured once with the loaded digit bank; unknown sources are null."""
+    return _MNIST_SHA256.get((split, root))
 
 
 def load_mnist(split="train", root=DATA_ROOT):
@@ -84,6 +110,8 @@ def load_mnist(split="train", root=DATA_ROOT):
     if key not in _MNIST:
         from torchvision.datasets import MNIST
         ds = MNIST(root, train=(split == "train"), download=True)
+        if split == "test":
+            _MNIST_SHA256[key] = _mnist_source_sha256(ds)
         d = ds.data.float() / 255.0                                       # [N,28,28]
         ink = d > 0.1
         rows = ink.any(dim=2)                                               # [N,28]

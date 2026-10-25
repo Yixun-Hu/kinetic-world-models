@@ -11,21 +11,26 @@ Logs: <out>/train.csv (every --log_every), <out>/val.csv, <out>/config.json,
 """
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
 import random
 import time
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 
-from .env import EnvConfig, make_batch
+from . import env
+from .env import EnvConfig, make_batch, mnist_sha256
 from .model import MODELS, COLLISIONS, build_model, count_params, make_wall0, oracle_nodes_from
 from .provenance import ROOT, source_hashes, env_fingerprint
 
 VAL_SEED = 12345
 VAL_T_OBS, VAL_T_PRED = 30, 150     # validation: T_obs (= the run's --t_obs) observed + 150 predicted frames
+VAL_CACHE_FIELDS = ("seed", "n", "T_obs", "T_pred", "chunk", "cfg", "env_sha256",
+                    "env_source_sha256", "mnist_sha256")
 
 # The defaults are the configuration of every result in docs/RESULTS.md (32 channels, batch 16,
 # 30 observed + 20 predicted frames, lr 1e-3, bf16 autocast). --preset flowm restores FloWM's own sizes;
@@ -50,13 +55,31 @@ def env_cfg_from_args(a, dt=1.0, split="train"):
     return EnvConfig(**kw)
 
 
+def val_cache_description(cache):
+    """Copy stored provenance only; missing legacy metadata stays unknown."""
+    return {key: cache.get(key) for key in VAL_CACHE_FIELDS}
+
+
 def val_cache(cfg, n, T_obs=VAL_T_OBS, T_pred=VAL_T_PRED, device="cpu", chunk=50, seed=VAL_SEED):
-    """Load or build a seeded set. The default validation path/content is unchanged."""
+    """Load or build a verified seeded set, preserving default paths and tensors."""
     os.makedirs(os.path.join(ROOT, "results"), exist_ok=True)
     sfx = f"_seed{seed}" if seed != VAL_SEED else ""
     path = os.path.join(ROOT, "results", f"val_cache_{cfg.tag()}_n{n}_T{T_obs}+{T_pred}{sfx}.pt")
+    fingerprint = env_fingerprint(cfg)
+    expected = dict(seed=seed, n=n, T_obs=T_obs, T_pred=T_pred, chunk=chunk,
+                    env_sha256=fingerprint["sha256"])
+    env_source_sha256 = hashlib.sha256(Path(env.__file__).read_bytes()).hexdigest()
     if os.path.exists(path):
-        return torch.load(path, weights_only=False)
+        cache = torch.load(path, weights_only=False)
+        if any(key not in cache for key in expected):
+            print(f"[kwm] WARNING: legacy validation cache {path} has no self-description; cannot verify seed/config")
+            return cache
+        for key, value in expected.items():
+            if cache[key] != value:
+                raise ValueError(f"Validation cache {path}: {key} mismatch (stored {cache[key]!r}, requested {value!r})")
+        if "env_source_sha256" in cache and cache["env_source_sha256"] != env_source_sha256:
+            print(f"[kwm] WARNING: validation cache {path} env_source_sha256 differs from current kwm/env.py")
+        return cache
     gen = torch.Generator().manual_seed(seed)
     parts = []
     for i in range(0, n, chunk):
@@ -68,8 +91,8 @@ def val_cache(cfg, n, T_obs=VAL_T_OBS, T_pred=VAL_T_PRED, device="cpu", chunk=50
                           bounce_events=ev,
                           **{k: v.cpu() for k, v in b["digit_states"].items()}))
     cache = {k: torch.cat([p[k] for p in parts], 0) for k in parts[0]}
-    cache["cfg"] = cfg.to_dict()
-    cache["T_obs"], cache["T_pred"] = T_obs, T_pred
+    cache.update(expected, cfg=fingerprint["cfg"], env_source_sha256=env_source_sha256,
+                 mnist_sha256=mnist_sha256())
     torch.save(cache, path)
     return cache
 

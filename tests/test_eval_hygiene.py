@@ -7,6 +7,7 @@ import platform
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -38,6 +39,7 @@ def tiny_data(tmp_path, monkeypatch):
     offsets = torch.full((3, 2), 13.5)
     halves = torch.tensor([[1.5, 5.5], [5.5, 1.5], [5.5, 5.5]])
     monkeypatch.setattr(env, "load_mnist", lambda split="train": (digits, offsets, halves))
+    monkeypatch.setattr(env, "_MNIST_SHA256", {})
     monkeypatch.setattr(train, "ROOT", str(tmp_path))
     return tmp_path
 
@@ -66,7 +68,12 @@ def test_cache_default_matches_original_generator(tiny_data, chunk):
     before = path.read_bytes()
     explicit = train.val_cache(cfg, 4, 3, 2, chunk=chunk, seed=train.VAL_SEED)
     assert path.read_bytes() == before
-    assert original.keys() == cache.keys() == explicit.keys()
+    assert original.keys() <= cache.keys() == explicit.keys()
+    metadata = dict(seed=12345, n=4, T_obs=3, T_pred=2, chunk=chunk, cfg=cfg.to_dict(),
+                    env_sha256=provenance.env_fingerprint(cfg)["sha256"],
+                    env_source_sha256=hashlib.sha256(Path(env.__file__).read_bytes()).hexdigest(),
+                    mnist_sha256=None)
+    assert train.val_cache_description(cache) == train.val_cache_description(explicit) == metadata
     for key in original:
         if isinstance(original[key], torch.Tensor):
             assert torch.equal(original[key], cache[key]), key
@@ -75,8 +82,99 @@ def test_cache_default_matches_original_generator(tiny_data, chunk):
             assert original[key] == cache[key] == explicit[key], key
     other = train.val_cache(cfg, 4, 3, 2, chunk=chunk, seed=777)
     assert path.with_name(path.stem + "_seed777.pt").is_file()
+    assert other["seed"] == 777
+    assert train.val_cache(cfg, 4, 3, 2, chunk=chunk, seed=777)["seed"] == 777
     assert not torch.equal(cache["frames"], other["frames"])
     assert not torch.equal(cache["actions"], other["actions"])
+
+
+def test_legacy_cache_loads_without_rewriting(tiny_data, capsys):
+    cfg = env.EnvConfig(world=28, window=12)
+    cache = train.val_cache(cfg, 2, 3, 2)
+    for key in ("seed", "n", "chunk", "env_sha256", "env_source_sha256", "mnist_sha256"):
+        del cache[key]
+    path = tiny_data / "results" / f"val_cache_{cfg.tag()}_n2_T3+2.pt"
+    torch.save(cache, path)
+    before = path.read_bytes()
+    loaded = train.val_cache(cfg, 2, 3, 2)
+    assert capsys.readouterr().out == (
+        f"[kwm] WARNING: legacy validation cache {path} has no self-description; cannot verify seed/config\n")
+    assert loaded.keys() == cache.keys()
+    assert torch.equal(loaded["frames"], cache["frames"])
+    assert path.read_bytes() == before
+    assert train.val_cache_description(loaded)["seed"] is None
+    assert train.val_cache_description(loaded)["env_sha256"] is None
+
+
+@pytest.mark.parametrize("field", ["seed", "n", "T_obs", "T_pred", "chunk", "env_sha256"])
+def test_cache_rejects_mismatched_self_description(tiny_data, field):
+    cfg = env.EnvConfig(world=28, window=12)
+    cache = train.val_cache(cfg, 2, 3, 2)
+    if field == "env_sha256":
+        other = env.EnvConfig(world=28, window=13)
+        assert other.tag() == cfg.tag()
+        cache[field] = provenance.env_fingerprint(other)["sha256"]
+    else:
+        cache[field] += 1
+    path = tiny_data / "results" / f"val_cache_{cfg.tag()}_n2_T3+2.pt"
+    torch.save(cache, path)
+    with pytest.raises(ValueError) as error:
+        train.val_cache(cfg, 2, 3, 2)
+    assert str(path) in str(error.value) and field in str(error.value)
+
+
+def test_cache_generator_source_change_only_warns(tiny_data, capsys):
+    cfg = env.EnvConfig(world=28, window=12)
+    cache = train.val_cache(cfg, 2, 3, 2)
+    cache["env_source_sha256"] = "old generator"
+    path = tiny_data / "results" / f"val_cache_{cfg.tag()}_n2_T3+2.pt"
+    torch.save(cache, path)
+    loaded = train.val_cache(cfg, 2, 3, 2)
+    warning = capsys.readouterr().out
+    assert warning.count("WARNING:") == 1
+    assert str(path) in warning and "env_source_sha256" in warning
+    assert loaded["env_source_sha256"] == "old generator"
+    assert torch.equal(loaded["frames"], cache["frames"])
+
+
+@pytest.mark.parametrize("source", ["raw", "legacy", "missing"])
+def test_mnist_fingerprint_tracks_loaded_files_once(tmp_path, monkeypatch, source):
+    from torchvision import datasets
+
+    raw = tmp_path / "MNIST" / "raw"
+    raw.mkdir(parents=True)
+    (raw / "t10k-images-idx3-ubyte").write_bytes(b"test images")
+    if source != "missing":
+        (raw / "t10k-labels-idx1-ubyte").write_bytes(b"test labels")
+    # These files are not read for the raw test split.
+    (raw / "train-images-idx3-ubyte").write_bytes(b"train images")
+    (raw / "t10k-images-idx3-ubyte.gz").write_bytes(b"compressed images")
+    processed = tmp_path / "MNIST" / "processed"
+    processed.mkdir()
+    (processed / "test.pt").write_bytes(b"legacy test data")
+    ds = SimpleNamespace(data=torch.ones(2, 28, 28, dtype=torch.uint8), raw_folder=str(raw),
+                         processed_folder=str(processed), test_file="test.pt",
+                         _check_legacy_exist=lambda: source == "legacy")
+
+    def fake_mnist(root, train, download):
+        assert root == str(tmp_path) and not train
+        return ds
+
+    monkeypatch.setattr(datasets, "MNIST", fake_mnist)
+    monkeypatch.setattr(env, "_MNIST", {})
+    monkeypatch.setattr(env, "_MNIST_SHA256", {})
+    assert env.mnist_sha256(root=str(tmp_path)) is None
+    bank = env.load_mnist("test", root=str(tmp_path))
+    expected = (None if source == "missing" else hashlib.sha256(
+        b"legacy test data" if source == "legacy" else b"test imagestest labels").hexdigest())
+    assert env.mnist_sha256(root=str(tmp_path)) == expected
+
+    def unexpected_rehash(ds):
+        pytest.fail("the in-process digit bank must reuse its captured fingerprint")
+
+    monkeypatch.setattr(env, "_mnist_source_sha256", unexpected_rehash)
+    assert env.load_mnist("test", root=str(tmp_path)) is bank
+    assert env.mnist_sha256(root=str(tmp_path)) == expected
 
 
 def test_source_hashes_and_environment():
@@ -148,6 +246,16 @@ def test_eval_json_and_unchanged_mse(tiny_data, capsys, test_seed, with_provenan
         flags.remove("--skip_ft")
         flags.remove("--skip_tp")
         flags += ["--equiv_boost", "--n_equiv", "2"]
+    else:
+        cfg = train.env_cfg_from_args(args, split="val")
+        cache = train.val_cache(cfg, 4, T_obs=3)
+        if test_seed is None:
+            for key in ("seed", "n", "chunk", "env_sha256", "env_source_sha256", "mnist_sha256"):
+                del cache[key]
+        else:
+            cache["env_source_sha256"] = "older generator"
+            cache["mnist_sha256"] = "original digit bank"
+        torch.save(cache, tiny_data / "results" / f"val_cache_{cfg.tag()}_n4_T3+150.pt")
     evaluate.main(flags)
     suffix = f"_seed{test_seed}_last" if test_seed not in (None, 12345) else ""
     res = json.loads((out / f"eval{suffix}_tiny.json").read_text())
@@ -167,6 +275,12 @@ def test_eval_json_and_unchanged_mse(tiny_data, capsys, test_seed, with_provenan
     assert len(evaluate.load_model(run, "last", "cpu")) == 3
     # Reproduce the old metric reduction exactly, including the non-full final batch.
     cache = train.val_cache(train.env_cfg_from_args(args, split="val"), 4, T_obs=3, seed=res["test_seed"])
+    assert res["sets"]["main"]["cache"] == train.val_cache_description(cache)
+    if test_seed is None:
+        assert res["sets"]["main"]["cache"]["seed"] is None
+    elif test_seed == 12345:
+        assert res["sets"]["main"]["cache"]["env_source_sha256"] == "older generator"
+        assert res["sets"]["main"]["cache"]["mnist_sha256"] == "original digit bank"
     mse = []
     for i in range(0, 4, 3):
         fr = cache["frames"][i:i + 3].float()
@@ -185,6 +299,8 @@ def test_eval_json_and_unchanged_mse(tiny_data, capsys, test_seed, with_provenan
         half_cfg = env.EnvConfig(**dict(res["env"], dt=0.5))
         assert (tiny_data / "results" / f"val_cache_{half_cfg.tag()}_n4_T6+40_seed777.pt").is_file()
         assert not (tiny_data / "results" / f"val_cache_{half_cfg.tag()}_n4_T6+40.pt").exists()
+        half_cache = train.val_cache(half_cfg, 4, T_obs=6, T_pred=40, seed=777)
+        assert res["sets"]["fractional_time"]["cache"] == train.val_cache_description(half_cache)
         assert res["sets"]["throughput"]["seed"] == 777
         for key in ("equiv", "equiv_output"):
             assert res["sets"][key]["seed"] == 777
