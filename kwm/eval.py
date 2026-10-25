@@ -25,7 +25,8 @@ import torch.nn.functional as F
 
 from .env import EnvConfig, subsample
 from .model import build_model, count_params, make_wall0, oracle_nodes_from
-from .train import ROOT, VAL_T_OBS, VAL_T_PRED, val_cache, env_cfg_from_args
+from .train import ROOT, VAL_SEED, VAL_T_OBS, VAL_T_PRED, val_cache, env_cfg_from_args
+from .provenance import source_hashes, env_fingerprint
 
 COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4"]
 
@@ -69,7 +70,7 @@ def digit_masks(cent, half, cam, world, win):
 
 
 # ------------------------------------------------------------ rollouts ----
-def load_model(run, which, device, node_update=None):
+def load_model(run, which, device, node_update=None, return_provenance=False):
     ck = torch.load(os.path.join(run, f"{which}.pt"), map_location=device, weights_only=False)
     args = dict(ck["args"])
     if node_update is not None:
@@ -77,7 +78,8 @@ def load_model(run, which, device, node_update=None):
     m = build_model(args).to(device)
     m.load_state_dict(ck["model"])
     m.eval()
-    return m, args, ck["step"]
+    result = (m, args, ck["step"])
+    return result + (ck.get("provenance"),) if return_provenance else result
 
 
 @torch.no_grad()
@@ -258,6 +260,8 @@ def main(argv=None):
     p.add_argument("--run", required=True)
     p.add_argument("--ckpt", default="best", help="checkpoint basename in the run dir: best | last | ckpt_step2000 ...")
     p.add_argument("--n_val", type=int, default=None, help="default: the run's --n_val")
+    p.add_argument("--test_seed", type=int, default=None,
+                   help="main and fractional-time cache seed (default: selection seed 12345)")
     p.add_argument("--bs", type=int, default=50)
     # the run's preset (T_obs, C, n_val, ...) is read from its checkpoint args
     p.add_argument("--device", default=None)
@@ -290,7 +294,8 @@ def main(argv=None):
     out_dir = a.out or os.path.join(ROOT, "results", name)
     os.makedirs(out_dir, exist_ok=True)
 
-    model, args, step = load_model(a.run, a.ckpt, device, node_update=a.node_update)
+    model, args, step, ckpt_provenance = load_model(a.run, a.ckpt, device, node_update=a.node_update,
+                                                    return_provenance=True)
     if a.node_update_pred is not None:
         model.node_update_pred = a.node_update_pred == "on"
         args = dict(args, node_update_pred=a.node_update_pred)
@@ -302,18 +307,26 @@ def main(argv=None):
     ns = argparse.Namespace(**args)
     n_val = a.n_val or args.get("n_val", 1000)
     cfg = env_cfg_from_args(args, split="val")
-    sfx = f"_{a.tag}" if a.tag else ""
+    test_seed = VAL_SEED if a.test_seed is None else a.test_seed
+    sfx = (f"_seed{test_seed}_{a.ckpt}" if test_seed != VAL_SEED else "") + (f"_{a.tag}" if a.tag else "")
     W, win, band = cfg.world, cfg.window, args.get("wall_band", 3)
-    cache = val_cache(cfg, n_val, T_obs=args.get("t_obs", VAL_T_OBS), device=device)
+    cache = val_cache(cfg, n_val, T_obs=args.get("t_obs", VAL_T_OBS), device=device, seed=test_seed)
     T_obs, T_pred = args.get("t_obs", VAL_T_OBS), VAL_T_PRED
     kinetic = args["model"] != "flowm"
+    provenance = dict(source_hashes(), eval_env=env_fingerprint(cfg))
+    if ckpt_provenance is not None and ckpt_provenance.get("files") != provenance["files"]:
+        print("[kwm] WARNING: evaluation source file hashes differ from checkpoint provenance.")
     res = dict(run=name, ckpt=a.ckpt, step=step, model=args["model"], params=count_params(model),
-               num_v=model.num_v, env=cfg.to_dict(), n_val=n_val, tag=a.tag,
+               num_v=model.num_v, env=cfg.to_dict(), n_val=n_val, tag=a.tag, seed=args.get("seed"),
+               test_seed=test_seed, provenance=provenance, ckpt_provenance=ckpt_provenance, sets={},
                node_update=model.node_update, node_update_pred=getattr(model, "node_update_pred", None),
                readout_rel=getattr(model, "readout_rel", None))
+    role = "selection" if test_seed == VAL_SEED else "heldout"
+    cache_set = dict(seed=test_seed, mnist_split="test", role=role, n=n_val, t_obs=T_obs, t_pred=T_pred, chunk=50)
 
     # ---------------- adaptive: node velocity error at the end of the observation ----------------
     if args["model"] == "adaptive" and not cfg.walls:
+        res["sets"]["node_velocity_error"] = dict(cache_set, n=min(64, n_val))
         ne = node_velocity_error(model, cache, args.get("t_obs", VAL_T_OBS), device)
         res["node_velocity_error_median"], res["node_velocity_error_mean"], res["node_velocity_error_n"] = \
             ne["median"], ne["mean"], ne["n"]
@@ -321,25 +334,38 @@ def main(argv=None):
 
     # ---------------- boost equivariance of the memory / of the predictions ----------------
     if a.equiv_boost or (a.only_equiv and not a.equiv_boost_output):
+        res["sets"]["equiv"] = dict(seed=777, mnist_split="test", role="heldout", n=a.n_equiv, chunk=16,
+                                     sequence_seed="seed * 1000 + chunk_start")
         res["equiv"] = equiv_memory(model, args, cfg, a.n_equiv, device)
         if args["model"] == "adaptive" and isinstance(res["equiv"], dict) and "comoving_off" in res["equiv"]:
             res["equiv"]["note"] = ("comoving_off is gauge-dependent for the adaptive model: with overlapping cells an object may be held "
                                     "by either of two neighbouring nodes; see equiv_output for the gauge-free check")
         print("[equiv]", json.dumps(res["equiv"]))
     if a.equiv_boost or a.equiv_boost_output:
+        res["sets"]["equiv_output"] = dict(seed=777, mnist_split="test", role="heldout", n=a.n_equiv, chunk=16,
+                                            sequence_seed="seed * 1000 + chunk_start")
         res["equiv_output"] = equiv_output(model, args, cfg, a.n_equiv, device)
         print("[equiv-output]", json.dumps(res["equiv_output"]))
     if a.only_equiv:
         path = os.path.join(out_dir, f"eval{sfx}.json")
         old = json.load(open(path)) if os.path.exists(path) else {}
         old.update({k: v for k, v in res.items() if k in ("equiv", "equiv_output")})
+        # A merged file may contain metrics from an earlier invocation. Keep their
+        # provenance, and identify the invocation that produced each new diagnostic.
+        diagnostic_keys = ("provenance", "ckpt_provenance", "seed", "test_seed", "sets")
+        for key in ("equiv", "equiv_output"):
+            if key in res:
+                old.setdefault("diagnostic_provenance", {})[key] = dict(
+                    {k: res[k] for k in diagnostic_keys}, ckpt=a.ckpt, step=step)
         for k, v in res.items():
-            old.setdefault(k, v)
+            if k not in diagnostic_keys:
+                old.setdefault(k, v)
         with open(path, "w") as f:
             json.dump(old, f, indent=1)
         return
 
     # ---------------- main rollout (150 frames) ----------------
+    res["sets"]["main"] = cache_set
     mse_f, psnr_f, ssim_f = [], [], []       # [N, T_pred] each
     bounce_rows, ctrl_rows, vel_rows = [], [], []
     sample = None
@@ -412,6 +438,7 @@ def main(argv=None):
     mse_f, psnr_f, ssim_f = torch.cat(mse_f), torch.cat(psnr_f), torch.cat(ssim_f)
     for H in (20, 150):
         res[f"mse{H}"], res[f"mse{H}_ci"] = ci95(mse_f[:, :H].mean(1).numpy())
+        res[f"per_seq_mse{H}"] = mse_f[:, :H].mean(1).tolist()
         res[f"psnr{H}"], res[f"psnr{H}_ci"] = ci95(psnr_f[:, :H].mean(1).numpy())
         res[f"ssim{H}"], res[f"ssim{H}_ci"] = ci95(ssim_f[:, :H].mean(1).numpy())
     curve = mse_f.mean(0).numpy()
@@ -433,7 +460,9 @@ def main(argv=None):
     if not a.skip_ft:
         cfg_h = EnvConfig(**dict(cfg.to_dict(), dt=0.5))
         Th_obs, Th_pred = 2 * T_obs, 40
-        ch = val_cache(cfg_h, n_val, T_obs=Th_obs, T_pred=Th_pred, device=device)
+        res["sets"]["fractional_time"] = dict(seed=test_seed, mnist_split="test", role=role, n=n_val,
+                                                t_obs=Th_obs, t_pred=Th_pred, dt=0.5, chunk=50)
+        ch = val_cache(cfg_h, n_val, T_obs=Th_obs, T_pred=Th_pred, device=device, seed=test_seed)
         ft = {"model_dt05": [], "copy": [], "interp": [], "dt1_even": []}
         for i in range(0, n_val, a.bs):
             sl = slice(i, i + a.bs)
@@ -473,6 +502,7 @@ def main(argv=None):
     # ---------------- throughput / memory ----------------
     if not a.skip_tp:
         tpb = a.tp_bs if device.startswith("cuda") else 2
+        res["sets"]["throughput"] = dict(cache_set, n=min(tpb, n_val))
         fr = cache["frames"][:tpb].float().to(device)
         an = cache["actions_noisy"][:tpb].to(device)
         cam0 = cache["cam"][:tpb, 0].to(device)
@@ -533,7 +563,9 @@ def main(argv=None):
         for r in range(2):
             axs[r, c].axis("off")
     fig.tight_layout(); fig.savefig(os.path.join(out_dir, f"samples{sfx}.png"), dpi=120); plt.close(fig)
-    print(json.dumps({k: v for k, v in res.items() if k not in ("mse_curve", "fractional_time")}, indent=1))
+    print(json.dumps({k: v for k, v in res.items()
+                      if not k.startswith("per_seq_")
+                      and k not in ("mse_curve", "fractional_time", "provenance", "ckpt_provenance")}, indent=1))
 
 
 if __name__ == "__main__":

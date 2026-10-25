@@ -89,6 +89,37 @@ python -m kwm.eval --run runs/adaptive --n_val 300 --equiv_boost
 
 `docs/REPRODUCE.md` lists the command for every table and figure.
 
+## Evaluation hygiene
+
+Training selects checkpoints on generated sequences with seed 12345. Evaluation
+uses those same sequences by default. Use `--test_seed 777` to evaluate on a
+separate set of generated scenes and trajectories from the same MNIST test image
+split. With `--ckpt last`, results are saved as `eval_seed777_last.json`.
+The seed controls main and fractional-time evaluation; equivariance retains its
+fixed independent generation scheme.
+Default cache paths and metric calculations are unchanged. Evaluation JSON now
+includes training/test seeds, per-sequence MSE, set roles, and source/software
+provenance. Dirty status covers tracked changes under `kwm/` and `scripts/`;
+resume warnings and provenance history expose changes in training source code.
+
+`scripts/report.py` summarizes multiple training seeds and computes paired tests
+and bootstrap intervals:
+
+```bash
+python -m kwm.eval --run runs/lk_s0 --ckpt last --test_seed 777
+python scripts/report.py --arm lk 'results/lk_s*/eval_seed777_last.json' \
+  --arm lock 'results/lock_s*/eval_seed777_last.json' --pairs lk:lock --holm
+```
+
+Reports reject incompatible evaluation sets/checkpoints and warn on selection-set
+scores, including legacy JSON. With fewer than six training seeds, exact sign-flip
+p-values cannot reach 0.05 and bootstrap intervals may be unstable. The hierarchical
+interval is conservative because resampling seeds and sequences counts within-seed
+noise twice.
+
+See [Evaluation hygiene](docs/EVAL_HYGIENE.md) for set definitions, JSON fields,
+manifest input, and statistical conventions.
+
 ## Layout
 
 ```
