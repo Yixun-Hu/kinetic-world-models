@@ -411,10 +411,10 @@ def test_bounce_and_boost_shared_snapshot():
     state = cell.initial_state(torch.zeros(1, 1, 8, 8))
     i, j = _node(nodes, (-1., 0.)), _node(nodes, (1., 0.))
     state.features[0, i, 0, 10:14, 1:5] = 1
-    state.nodes[0, i] = torch.tensor([-.3, .2, 5., 1.])
+    state.nodes[0, i, :4] = torch.tensor([-.3, .2, 5., 1.])
     out = cell.bounce(state, nodes, px, py, known_wall_field(24, band=2)[None])
     assert out.features[0, j, 0].sum() == 16
-    torch.testing.assert_close(out.nodes[0, j], torch.tensor([.3, .2, 5., 1.]))
+    torch.testing.assert_close(out.nodes[0, j, :4], torch.tensor([.3, .2, 5., 1.]))
     assert out.snapshot is state.snapshot
     boosted, mask = boost_transform_nodes(state, nodes, 1., 2, torch.tensor([[1., 0.]]), .75)
     assert boosted.snapshot is state.snapshot

@@ -70,11 +70,14 @@ def digit_masks(cent, half, cam, world, win):
 
 
 # ------------------------------------------------------------ rollouts ----
-def load_model(run, which, device, node_update=None, return_provenance=False):
+def load_model(run, which, device, node_update=None, return_provenance=False, order=None, accel_kappa=None, nu_forget=None):
     ck = torch.load(os.path.join(run, f"{which}.pt"), map_location=device, weights_only=False)
     args = dict(ck["args"])
     if node_update is not None:
         args["node_update"] = node_update
+    for key, value in (("order", order), ("accel_kappa", accel_kappa), ("nu_forget", nu_forget)):
+        if value is not None:
+            args[key] = value
     m = build_model(args).to(device)
     m.load_state_dict(ck["model"])
     m.eval()
@@ -280,6 +283,9 @@ def main(argv=None):
                    help="adaptive: override whether nodes/imprints are updated during the prediction phase")
     p.add_argument("--node_update", default=None, choices=["lk", "lock"],
                    help="adaptive estimator override; default: checkpoint's saved value (lk for older checkpoints)")
+    p.add_argument("--order", type=int, choices=[1, 2], default=None)
+    p.add_argument("--accel_kappa", type=float, default=None, help="override gate strength; inf closes it")
+    p.add_argument("--nu_forget", type=float, default=None)
     # boost equivariance (on / off the velocity lattice)
     p.add_argument("--equiv_boost", action="store_true", help="boost equivariance of the memory (t=10,30) and of the predictions (t=10,20)")
     p.add_argument("--n_equiv", type=int, default=48)
@@ -295,7 +301,7 @@ def main(argv=None):
     os.makedirs(out_dir, exist_ok=True)
 
     model, args, step, ckpt_provenance = load_model(a.run, a.ckpt, device, node_update=a.node_update,
-                                                    return_provenance=True)
+                                                    return_provenance=True, order=a.order, accel_kappa=a.accel_kappa, nu_forget=a.nu_forget)
     if a.node_update_pred is not None:
         model.node_update_pred = a.node_update_pred == "on"
         args = dict(args, node_update_pred=a.node_update_pred)
@@ -307,6 +313,8 @@ def main(argv=None):
     ns = argparse.Namespace(**args)
     n_val = a.n_val or args.get("n_val", 1000)
     cfg = env_cfg_from_args(args, split="val")
+    if cfg.accel and model.oracle:
+        raise ValueError("the constant-velocity oracle model is undefined on K-accel")
     test_seed = VAL_SEED if a.test_seed is None else a.test_seed
     sfx = (f"_seed{test_seed}_{a.ckpt}" if test_seed != VAL_SEED else "") + (f"_{a.tag}" if a.tag else "")
     W, win, band = cfg.world, cfg.window, args.get("wall_band", 3)
@@ -320,7 +328,10 @@ def main(argv=None):
                num_v=model.num_v, env=cfg.to_dict(), n_val=n_val, tag=a.tag, seed=args.get("seed"),
                test_seed=test_seed, provenance=provenance, ckpt_provenance=ckpt_provenance, sets={},
                node_update=model.node_update, node_update_pred=getattr(model, "node_update_pred", None),
-               readout_rel=getattr(model, "readout_rel", None))
+               readout_rel=getattr(model, "readout_rel", None), order=model.order,
+               accel_kappa=("inf" if args.get("accel_kappa", 9.) == float('inf') else args.get("accel_kappa", 9.)),
+               accel_var_inflation=args.get("accel_var_inflation", 4.),
+               nu_forget=args.get("nu_forget", 1.), pred_shrink=args.get("pred_shrink", "none"))
     role = "selection" if test_seed == VAL_SEED else "heldout"
     cache_set = dict(seed=test_seed, mnist_split="test", role=role, n=n_val, t_obs=T_obs, t_pred=T_pred, chunk=50)
 

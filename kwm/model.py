@@ -36,7 +36,7 @@ import torch.nn as nn
 import torch.utils.checkpoint as ckpt
 
 from .cells import FloWMCell, KineticCell, AdaptiveNodeCell
-from .lock_nodes import LockState, features
+from .lock_nodes import LockState, features, CORR, transport_velocity
 from .collision import (lattice_nodes, reflection_perms, bounce_back, rigid_bounce_back,
                         known_wall_field, WallEncoder, VMixing, MLPCollision)
 from .transport import spectral_shift
@@ -58,7 +58,8 @@ class KineticWM(nn.Module):
                  bounce="rigid", rigid_K=28, rigid_eps=1e-3, rigid_eps_rel=0.05,
                  dec_input="flowm", beta_init=10.0, grad_ckpt=False,
                  n_digits=5, imprint_k=8, imprint_gamma=0.9,
-                 node_update_pred=True, readout_rel=False, node_update="lk"):
+                 node_update_pred=True, readout_rel=False, node_update="lk", order=1,
+                 accel_kappa=9., accel_var_inflation=4., nu_forget=1., pred_shrink="none"):
         super().__init__()
         if kind not in MODELS:
             raise ValueError(f"model must be one of {MODELS}")
@@ -68,8 +69,12 @@ class KineticWM(nn.Module):
         self.dec_input, self.grad_ckpt = dec_input, grad_ckpt
         self.node_update_pred = node_update_pred   # adaptive: keep updating nodes / imprints on the model's own predictions
         self.node_update = node_update
+        if order == 2 and (kind != "adaptive" or node_update != "lock"):
+            raise ValueError("--order 2 requires an adaptive model with --node_update lock")
+        self.order = order
         self.readout_rel = readout_rel             # moment readout uses velocities relative to the observer
         self._rel = None
+        self._dt = 1.
         self.oracle = kind == "oracle"            # nodes = per-sequence true digit velocities + (0,0)
         self._nodes_ovr = None
         self.state_extra = 0                       # Extra spatial channels only; lock metadata is separate.
@@ -100,7 +105,9 @@ class KineticWM(nn.Module):
                 if collision not in ("none", "bounce"):
                     raise ValueError("adaptive supports --collision none or bounce")
                 self.cell = AdaptiveNodeCell(in_ch, C, world, window, num_v=V, spacing=node_spacing,
-                                             imprint_k=imprint_k, gamma=imprint_gamma, node_update=node_update)
+                                             imprint_k=imprint_k, gamma=imprint_gamma, node_update=node_update,
+                                             order=order, accel_kappa=accel_kappa, accel_var_inflation=accel_var_inflation,
+                                             nu_forget=nu_forget, pred_shrink=pred_shrink)
                 self.state_extra = self.cell.extra + self.cell.K_imp if node_update == "lk" else 0
             else:
                 self.cell = KineticCell(in_ch, C, world, window, num_v=V)
@@ -159,7 +166,7 @@ class KineticWM(nn.Module):
         nodes = self.nodes()
         nv = (nodes if nodes.dim() == 3 else nodes[None].expand(B, -1, -1))[..., None, None]   # [B,V,2,1,1]
         if self.kind == "adaptive":                                            # per-sample adaptive nodes
-            nv = (nodes[None].float() + self.cell.offsets(h))[..., None, None]
+            nv = self.diagnostic_velocity(h, self._dt)[..., None, None]
         return nv.expand(-1, -1, -1, self.window, self.window)
 
     def decode(self, h, aux=None):
@@ -186,7 +193,7 @@ class KineticWM(nn.Module):
         return self.decoder_conv(z)
 
     # ------------------------------------------------------------------
-    def _step(self, frame, h, a, dt, wall, update_nodes=None):
+    def _step(self, frame, h, a, dt, wall, update_nodes=None, prediction=False):
         """One recurrence step. wall (ego frame of h) or None. Returns (h_new, wall_new)."""
         if self.kind == "flowm":
             return self.cell(frame, h, a, dt), wall
@@ -204,10 +211,12 @@ class KineticWM(nn.Module):
                 coll = lambda hh: bounce_back(hh, nodes, px, py, wall, self.bounce_mode)
         elif self.coll is not None:
             coll = self.coll
-        h_new = self.cell(frame, h, a, nodes, dt, coll, update_nodes=update_nodes)
+        kw = dict(prediction=prediction) if self.kind == "adaptive" else {}
+        h_new = self.cell(frame, h, a, nodes, dt, coll, update_nodes=update_nodes, **kw)
         if self._node_traj is not None and self.kind == "adaptive":
-            self._node_traj.append((nodes[None].float() + self.cell.offsets(h_new)).detach()
-                                   if self.node_update == "lock" else self.cell.last_nodes)
+            with torch.no_grad():
+                self._node_traj.append(self.diagnostic_velocity(h_new, dt).detach()
+                                      if self.node_update == "lock" else self.cell.last_nodes)
         if wall is not None:
             wall = spectral_shift(wall, -a)                                   # static (nu=0) transport
             if self.wall_enc is not None:
@@ -218,17 +227,24 @@ class KineticWM(nn.Module):
                 wall = wall.clamp(0, 1)
         return h_new, wall
 
-    def step(self, frame, h, a, dt, wall):
+    def diagnostic_velocity(self, h, dt=1.):
+        """Outgoing interval-mean velocity, matching env.digit_states.vel."""
+        if self.kind == "adaptive" and self.order == 2:
+            return transport_velocity(h.nodes, self.nodes(), dt, self.cell.accel_kappa,
+                                      self.cell.accel_var_inflation, self.cell.bound)
+        return self.nodes()[None].float() + self.cell.offsets(h)
+
+    def step(self, frame, h, a, dt, wall, prediction=False):
         # Capture the phase before checkpointing: forward() restores the mutable
         # legacy flag before backward recomputes the prediction steps.
         update = self.cell.update_nodes if self.kind == "adaptive" and self.node_update == "lock" else None
         if self.grad_ckpt and self.training and torch.is_grad_enabled():
             if wall is None:
-                return ckpt.checkpoint(lambda f, hh, aa: self._step(f, hh, aa, dt, None, update),
+                return ckpt.checkpoint(lambda f, hh, aa: self._step(f, hh, aa, dt, None, update, prediction),
                                        frame, h, a, use_reentrant=False)
-            return ckpt.checkpoint(lambda f, hh, aa, ww: self._step(f, hh, aa, dt, ww, update),
+            return ckpt.checkpoint(lambda f, hh, aa, ww: self._step(f, hh, aa, dt, ww, update, prediction),
                                    frame, h, a, wall, use_reentrant=False)
-        return self._step(frame, h, a, dt, wall, update)
+        return self._step(frame, h, a, dt, wall, update, prediction)
 
     def forward(self, obs, actions_in, actions_out, target=None, tf_ratio=0.0, dt=1.0,
                 wall0=None, return_aux=False, nodes=None, return_states=None, record_nodes=False):
@@ -254,6 +270,7 @@ class KineticWM(nn.Module):
                 self.cell.update_nodes = True
 
     def _forward(self, obs, actions_in, actions_out, target, tf_ratio, dt, wall0, return_aux, keep=()):
+        self._dt = dt
         B, T_in = obs.shape[:2]
         T_pred = actions_out.shape[1]
         dev = obs.device
@@ -267,8 +284,14 @@ class KineticWM(nn.Module):
             else:
                 wall = obs.new_zeros(B, 4, self.world, self.world)
         states = {}
+        clamp_counts = [obs.new_zeros((), dtype=torch.float32), obs.new_zeros((), dtype=torch.float32)]
+        def count_clamps(state, phase):
+            if isinstance(state, LockState) and self.order == 2:
+                clamp_counts[phase] += ((state.nodes[..., :2] + state.nodes[..., CORR]).abs() > self.cell.bound).any(-1).float().sum()
+
         for t in range(T_in):
             h, wall = self.step(obs[:, t], h, actions_in[:, t], dt, wall)
+            count_clamps(h, 0)
             if t in keep:
                 states[t] = (LockState(*(x.detach().float().clone() for x in h))
                              if isinstance(h, LockState) else h.detach().float().clone())
@@ -285,7 +308,8 @@ class KineticWM(nn.Module):
                 frame = torch.zeros_like(prev)
             else:
                 frame = prev
-            h, wall = self.step(frame, h, actions_out[:, t], dt, wall)
+            h, wall = self.step(frame, h, actions_out[:, t], dt, wall, prediction=True)
+            count_clamps(h, 1)
             self._rel = actions_out[:, t] / dt if self.readout_rel else None
             out = self.decode(h, aux)
             outs.append(out)
@@ -293,6 +317,9 @@ class KineticWM(nn.Module):
         preds = torch.stack(outs, 1)
         if return_aux:
             out = {k: torch.stack(v, 1) for k, v in aux.items()}
+            if self.kind == "adaptive" and self.node_update == "lock":
+                out["clamp_rate_obs"] = clamp_counts[0] / max(1, B * self.num_v * T_in)
+                out["clamp_rate_pred"] = clamp_counts[1] / max(1, B * self.num_v * T_pred)
             if keep:
                 out["states"] = states
             return preds, out
@@ -320,6 +347,8 @@ def build_model(args):
                      rigid_eps_rel=g("rigid_eps_rel", 0.05),
                      imprint_k=g("imprint_k", 8), imprint_gamma=g("imprint_gamma", 0.9),
                      node_update_pred=(g("node_update_pred", "on") == "on"),
-                     node_update=g("node_update", "lk"),
+                     node_update=g("node_update", "lk"), order=g("order", 1),
+                     accel_kappa=g("accel_kappa", 9.), accel_var_inflation=g("accel_var_inflation", 4.),
+                     nu_forget=g("nu_forget", 1.), pred_shrink=g("pred_shrink", "none"),
                      readout_rel=(g("readout_rel", "off") == "on"),
                      grad_ckpt=g("grad_ckpt", False))

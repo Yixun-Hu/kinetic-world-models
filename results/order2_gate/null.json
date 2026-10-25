@@ -1,0 +1,105 @@
+{
+  "n": 100,
+  "seed": 777,
+  "batch_size": 2,
+  "cell_seed": 0,
+  "C": 32,
+  "K": 8,
+  "observed_frames": 30,
+  "dtype": "float32",
+  "device": "cpu",
+  "environment": {
+    "world": 50,
+    "window": 32,
+    "n_digits": 5,
+    "real_velocity": true,
+    "real_camera": true,
+    "walls": false,
+    "odometry_noise": 0.0,
+    "odometry_bias": 0.0,
+    "vmax": 2.0,
+    "amax": 10.0,
+    "dt": 1.0,
+    "v_ring": 0.0,
+    "scene_boost": 0.0,
+    "bounce_rule": "bbox",
+    "accel": 0.02,
+    "accel_zero_p": 0.3,
+    "accel_min": 0.002,
+    "accel_horizon": 180.0
+  },
+  "rows": [
+    {
+      "inflation": 1.0,
+      "kappa": 4.0,
+      "open_node_steps": 3316,
+      "node_steps": 75000,
+      "null_rate": 0.04421333223581314,
+      "null_rate_at30": 0.06239999830722809
+    },
+    {
+      "inflation": 1.0,
+      "kappa": 9.0,
+      "open_node_steps": 2721,
+      "node_steps": 75000,
+      "null_rate": 0.03627999871969223,
+      "null_rate_at30": 0.05040000006556511
+    },
+    {
+      "inflation": 2.0,
+      "kappa": 4.0,
+      "open_node_steps": 2805,
+      "node_steps": 75000,
+      "null_rate": 0.03739999979734421,
+      "null_rate_at30": 0.052799999713897705
+    },
+    {
+      "inflation": 2.0,
+      "kappa": 9.0,
+      "open_node_steps": 2222,
+      "node_steps": 75000,
+      "null_rate": 0.029626667499542236,
+      "null_rate_at30": 0.04280000180006027
+    },
+    {
+      "inflation": 4.0,
+      "kappa": 4.0,
+      "open_node_steps": 2300,
+      "node_steps": 75000,
+      "null_rate": 0.030666666105389595,
+      "null_rate_at30": 0.04320000112056732
+    },
+    {
+      "inflation": 4.0,
+      "kappa": 9.0,
+      "open_node_steps": 1621,
+      "node_steps": 75000,
+      "null_rate": 0.021613333374261856,
+      "null_rate_at30": 0.029600000008940697
+    }
+  ],
+  "chosen_inflation": 4.0,
+  "passed": false,
+  "seconds": 159.03331740293652,
+  "dataset_sha256": "0e1e3a8423b472f4bb50c8ec7963c21e31899acebec6b51bae28a00d6e3e04d7",
+  "dataset_environment": {
+    "world": 50,
+    "window": 32,
+    "n_digits": 5,
+    "real_velocity": true,
+    "real_camera": true,
+    "walls": false,
+    "odometry_noise": 0.0,
+    "odometry_bias": 0.0,
+    "vmax": 2.0,
+    "amax": 10.0,
+    "dt": 1.0,
+    "v_ring": 0.0,
+    "scene_boost": 0.0,
+    "bounce_rule": "bbox",
+    "accel": 0.0,
+    "accel_zero_p": 0.3,
+    "accel_min": 0.002,
+    "accel_horizon": 180.0
+  }
+}

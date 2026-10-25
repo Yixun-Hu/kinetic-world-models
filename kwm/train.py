@@ -47,7 +47,9 @@ def env_cfg_from_args(a, dt=1.0, split="train"):
     vtr = g("vmax_train", 2.0)
     kw = dict(world=g("world"), window=g("window"), real_velocity=g("real_velocity"), real_camera=g("real_camera"),
               walls=g("walls"), odometry_noise=g("odometry_noise"), odometry_bias=g("odometry_bias"), dt=dt,
-              bounce_rule=g("bounce_rule"), vmax=vtr)
+              bounce_rule=g("bounce_rule"), vmax=vtr,
+              accel=g("accel", 0.0), accel_zero_p=g("accel_zero_p", 0.3),
+              accel_min=g("accel_min", 2e-3), accel_horizon=g("accel_horizon", 180.0))
     if split == "val":
         vte = g("vmax_test", None) or vtr
         lo = g("v_ring_lo", None) or vtr
@@ -75,6 +77,12 @@ def val_cache(cfg, n, T_obs=VAL_T_OBS, T_pred=VAL_T_PRED, device="cpu", chunk=50
             print(f"[kwm] WARNING: legacy validation cache {path} has no self-description; cannot verify seed/config")
             return cache
         for key, value in expected.items():
+            if key == "env_sha256" and cache[key] != value and "cfg" in cache:
+                old = cache["cfg"]
+                normalized = EnvConfig(**old).to_dict()
+                if (not cfg.accel and normalized == cfg.to_dict()
+                        and env_fingerprint(old)["sha256"] == cache[key]):
+                    continue
             if cache[key] != value:
                 raise ValueError(f"Validation cache {path}: {key} mismatch (stored {cache[key]!r}, requested {value!r})")
         if "env_source_sha256" in cache and cache["env_source_sha256"] != env_source_sha256:
@@ -132,6 +140,10 @@ def get_parser():
     g = p.add_argument_group("data")
     g.add_argument("--real_velocity", action="store_true", help="real-valued digit velocities (default: integers)")
     g.add_argument("--real_camera", action="store_true", help="real-valued camera motion (default: integers)")
+    g.add_argument("--accel", type=float, default=0.0, help="maximum digit acceleration magnitude; 0 disables")
+    g.add_argument("--accel_zero_p", type=float, default=0.3, help="proposal probability of zero acceleration")
+    g.add_argument("--accel_min", type=float, default=2e-3, help="minimum nonzero acceleration magnitude")
+    g.add_argument("--accel_horizon", type=float, default=180., help="speed-bound horizon in time units")
     g.add_argument("--walls", action="store_true", help="reflecting walls (default: periodic world)")
     g.add_argument("--odometry_noise", type=float, default=0.0, help="std of additive noise on the actions")
     g.add_argument("--odometry_bias", type=float, default=0.0, help="relative scale error of the actions")
@@ -161,6 +173,11 @@ def get_parser():
     g.add_argument("--node_update_pred", default="on", choices=["on", "off"],
                    help="adaptive: update the nodes also from the model's own predictions (on, as in the "
                         "reported results) or only from observations (off, experimental)")
+    g.add_argument("--order", type=int, choices=[1, 2], default=1, help="lock velocity order")
+    g.add_argument("--accel_kappa", type=float, default=9., help="acceleration gate strength; inf closes it")
+    g.add_argument("--accel_var_inflation", type=float, default=4., help="empirical slope-variance inflation")
+    g.add_argument("--nu_forget", type=float, default=1., help="lock evidence retention per update, (0,1]")
+    g.add_argument("--pred_shrink", choices=["learned", "none"], default="none", help="learned prediction velocity shrink")
     g.add_argument("--dec_input", default="flowm", choices=["flowm", "zero"],
                    help="prediction-phase input: the previous prediction (FloWM) or zeros")
     # walls (experimental)
@@ -207,7 +224,13 @@ def parse_args(argv=None):
     pre, _ = p.parse_known_args(argv)
     if pre.preset:
         p.set_defaults(**PRESETS[pre.preset])
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.order == 2 and (args.node_update != "lock" or args.model != "adaptive"):
+        raise ValueError("--order 2 requires --model adaptive --node_update lock")
+    env_cfg_from_args(args)  # fail before creating run directories
+    if args.model == "oracle" and args.accel:
+        raise ValueError("the constant-velocity oracle model is undefined on K-accel")
+    return args
 
 
 def main(argv=None):

@@ -14,7 +14,7 @@ from .transport import _phase, lk_displacement
 
 class LockState(NamedTuple):
     features: torch.Tensor  # [B,V,C,H,W], feature/autocast dtype
-    nodes: torch.Tensor     # [B,V,4], fp32: rho_x, rho_y, evidence, locked
+    nodes: torch.Tensor     # [B,V,NODE_DIM], fp32; layout below (PR1 prefix unchanged)
     snapshot: torch.Tensor  # [B,K,win,win], fp32, shared by all nodes
 
 
@@ -84,7 +84,7 @@ def pool(displacement, weight):
 
 
 @torch.no_grad()
-def two_modes(displacement, weight, nu, lattice, lag, bound=0.75):
+def two_modes(displacement, weight, nu, lattice, lag, bound=0.75, return_mode=False):
     """Weighted k=2 along the principal axis, within a node's reachable cell.
 
     Up to two modes: require >=10% mass in each and separation >=0.1 px/frame.
@@ -120,7 +120,9 @@ def two_modes(displacement, weight, nu, lattice, lag, bound=0.75):
     wp = torch.where(split, wp, total)
     selected = torch.where(take_left[..., None], wl, wh)
     selected = torch.where(split[..., None], selected, w).reshape_as(weight)
-    return primary * lag, wp, selected
+    result = (primary * lag, wp, selected)
+    mode = torch.where(split, torch.where(take_left, 1., 2.), 0.)
+    return (*result, mode) if return_mode else result
 
 
 
@@ -212,7 +214,7 @@ class LocalSearch:
 
 
 def lock_measurement(previous, current, nu, lattice, action, world, dt=1.0,
-                     lam_rel=1e-2, tr_rel=0.1, gate=0.6, coh_rel=0.5, bound=0.75):
+                     lam_rel=1e-2, tr_rel=0.1, gate=0.6, coh_rel=0.5, bound=0.75, return_mode=False):
     """Return residual, evidence, and the freshly evaluated lock bit.
 
     LK retains its displacement derivative at locked nodes. Search, all gates,
@@ -235,10 +237,94 @@ def lock_measurement(previous, current, nu, lattice, action, world, dt=1.0,
             d = torch.where(locked[..., None, None, None], lk, d)
             usable = torch.where(locked[..., None, None], True, usable)
             weight = coherence(m, current, trace, d, support * usable, dt, tr_rel, gate, coh_rel)
-            delta, evidence, selected = two_modes(d, weight, nu, lattice, dt, bound)
+            modes = two_modes(d, weight, nu, lattice, dt, bound, return_mode=return_mode)
+            delta, evidence, selected = modes[:3]
         # Keep the forward value exactly equal to the detached mode estimator.
         # Only the selected, locked LK field receives a displacement gradient.
         differentiable = (selected[:, :, None] * lk).sum((-2, -1)) / evidence[..., None].clamp_min(1e-6)
         differentiable = torch.where(locked[..., None], differentiable, 0)
         delta = delta + (differentiable - differentiable.detach())
-        return delta, evidence, locked.float()
+        result = (delta, evidence, locked.float())
+        return (*result, modes[3]) if return_mode else result
+
+
+# Compact layout shared by both orders. Welford's centred moments avoid
+# subtracting large, nearly equal raw second moments in fp32.
+# 0:4 PR1; 4 W_fit, 5 mean_t, 6 Ctt, 7:9 mean_z, 9:11 Ctz,
+# 11 sum(w²), 12 Czz (trace); 13 selected split mode; 14 next observation time;
+# 15:17 additive instantaneous-velocity correction (carried during prediction).
+SW, MT, CTT, MZ, CTZ, SW2, CZZ, MODE, TIME, CORR = 4, 5, 6, slice(7, 9), slice(9, 11), 11, 12, 13, 14, slice(15, 17)
+NODE_DIM = 17
+
+
+@torch.no_grad()
+def acceleration_fit(state, kappa=9., inflation=4.):
+    """Return detached slope, scalar gate, trace Var(slope), n_eff.
+
+    n_eff = (sum w)^2 / sum(w²); residual scatter has denominator
+    W - 2 W/n_eff. The trace of the 2D slope covariance is scatter/Ctt,
+    inflated for shared-frame displacement errors. No model scale n_s enters.
+    """
+    w, ctt = state[..., SW], state[..., CTT]
+    neff = w.square() / state[..., SW2].clamp_min(1e-12)
+    valid = (neff >= 3) & (ctt >= 1e-6)
+    slope = state[..., CTZ] / ctt[..., None].clamp_min(1e-6)
+    slope = torch.where(valid[..., None], slope, 0)
+    rss = (state[..., CZZ] - (state[..., CTZ] * slope).sum(-1)).clamp_min(0)
+    dof = w * (1 - 2 / neff.clamp_min(1))
+    variance = inflation * rss / dof.clamp_min(1e-6) / ctt.clamp_min(1e-6)
+    if kappa == float('inf'):
+        gate = torch.zeros_like(w)
+    else:
+        power = slope.square().sum(-1)
+        gate = (1 - kappa * variance / power.clamp_min(1e-20)).clamp(0, 1)
+        gate = torch.where(valid & (power > 1e-20), gate, 0)
+    return slope, gate, variance, neff
+
+
+@torch.no_grad()
+def accumulate_acceleration(state, z, weight, time, locked, mode):
+    """Detached weighted centred sums; reset on a split-mode or unlock jump.
+
+    mode 0 = unsplit, 1/2 = canonical principal-axis left/right. Compare
+    consecutive split identities; disappearing/reappearing splits alone do
+    not constitute a switch. Reset before consuming the new measurement.
+    """
+    out = state.detach().float().clone()
+    switched = (state[..., MODE] > 0) & (mode > 0) & (state[..., MODE] != mode)
+    reset = switched | ((state[..., 3] > .5) & (locked < .5))
+    out[..., 4:13] = torch.where(reset[..., None], 0, out[..., 4:13])
+    w0 = out[..., SW].clone()
+    w = weight.detach().float()
+    total = w0 + w
+    gain = w / total.clamp_min(1e-12)
+    dt = time - out[..., MT]
+    dz = z.detach().float() - out[..., MZ]
+    cross = w0 * gain
+    out[..., CTT] += cross * dt.square()
+    out[..., CTZ] += (cross * dt)[..., None] * dz
+    out[..., CZZ] += cross * dz.square().sum(-1)
+    out[..., MT] += gain * dt
+    out[..., MZ] += gain[..., None] * dz
+    out[..., SW] = total
+    out[..., SW2] += w.square()
+    out[..., MODE] = mode
+    return out
+
+
+def corrected_offsets(state, bound=.75):
+    """Instantaneous offset, with an exact PR1 branch when correction is zero."""
+    rho, correction = state[..., :2], state[..., CORR]
+    return torch.where(correction != 0, (rho + correction).clamp(-bound, bound), rho)
+
+
+def transport_velocity(state, lattice, dt, kappa=9., inflation=4., bound=.75):
+    """Outgoing interval-mean velocity: v(t) + .5 gated_a dt.
+
+    The stream operator multiplies this by dt. Disabled gates preserve every
+    PR1 operation on velocity, including the lattice + rho addition.
+    """
+    slope, gate, _, _ = acceleration_fit(state, kappa, inflation)
+    nu = lattice[None].float() + corrected_offsets(state, bound)
+    half = .5 * (gate[..., None] * slope) * dt
+    return torch.where(half != 0, nu + half, nu)

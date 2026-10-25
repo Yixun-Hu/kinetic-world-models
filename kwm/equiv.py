@@ -12,7 +12,7 @@ For the adaptive-node model the boost moves every node velocity nu_i = lattice_i
 import torch
 
 from .transport import spectral_shift
-from .lock_nodes import LockState, features
+from .lock_nodes import LockState, features, MZ
 
 
 def _lattice_index(nodes, spacing):
@@ -82,11 +82,16 @@ def boost_transform_nodes(h, nodes, spacing, C, nu_hat, bound, extra=3):
     same comoving observation frame. Returns (h', target_mask [B,V])."""
     if isinstance(h, LockState):
         H, W = h.features.shape[-2:]
-        packed = torch.cat([h.features.float(), h.nodes[..., None, None].expand(-1, -1, -1, H, W)], 2)
-        transformed, mask = boost_transform_nodes(packed, nodes, spacing, C, nu_hat, bound, extra=4)
+        metadata = h.nodes.clone()
+        # Centred covariance and carried acceleration are boost invariant;
+        # only the weighted velocity mean shifts. Empty fits remain zero.
+        if metadata.shape[-1] > 4:
+            metadata[..., MZ] += nu_hat[:, None] * (metadata[..., 4:5] > 0)
+        packed = torch.cat([h.features.float(), metadata[..., None, None].expand(-1, -1, -1, H, W)], 2)
+        transformed, mask = boost_transform_nodes(packed, nodes, spacing, C, nu_hat, bound, extra=h.nodes.shape[-1])
         st = transformed[:, :, C:, 0, 0]
         # A merged target is locked only if all of its contributing mass was.
-        st = torch.cat([st[..., :3], (st[..., 3:] >= 1 - 1e-6).float()], -1)
+        st = torch.cat([st[..., :3], (st[..., 3:4] >= 1 - 1e-6).float(), st[..., 4:]], -1)
         return LockState(transformed[:, :, :C].to(h.features.dtype), st, h.snapshot), mask
     B, V, _, H, W = h.shape
     E = extra

@@ -31,7 +31,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
-from scipy.optimize import linear_sum_assignment
+from scripts.assignment import linear_sum_assignment
 import torch
 import torch.nn.functional as F
 
@@ -943,6 +943,9 @@ def self_check(cell):
 
 
 def main():
+    if any(arg == "--accel" or arg.startswith("--accel=") for arg in sys.argv[1:]):
+        from scripts.order2_gate import main as order2_main
+        return order2_main()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--n", type=int, default=300)
     parser.add_argument("--seed", type=int, default=2024)

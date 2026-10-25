@@ -56,6 +56,23 @@ class EnvConfig:
     scene_boost: float = 0.0        # >0: add one per-sequence boost u ~ U[-b, b]^2 to every digit
     bounce_rule: str = "bbox"       # 'bbox' (default) | 'centroid'
 
+    accel: float = 0.0            # maximum acceleration magnitude, px / time-unit²
+    accel_zero_p: float = 0.3
+    accel_min: float = 2e-3
+    accel_horizon: float = 180.0
+
+    def __post_init__(self):
+        if self.accel < 0 or not math.isfinite(self.accel):
+            raise ValueError("accel must be finite and nonnegative")
+        if self.accel:
+            if self.walls:
+                raise ValueError("--accel cannot be combined with --walls")
+            if not (0 < self.accel_min <= self.accel and 0 <= self.accel_zero_p <= 1
+                    and self.accel_horizon > 0 and math.isfinite(self.accel_horizon) and self.vmax > 0):
+                raise ValueError("invalid acceleration law parameters")
+            if self.v_ring or self.scene_boost:
+                raise ValueError("accel does not support v_ring or scene_boost (bounded joint law)")
+
     def tag(self):
         s = f"w{self.world}_vel{int(self.real_velocity)}_cam{int(self.real_camera)}_walls{int(self.walls)}"
         if self.odometry_noise or self.odometry_bias:
@@ -70,6 +87,12 @@ class EnvConfig:
             s += f"_ring{self.v_ring:g}"
         if self.scene_boost:
             s += f"_sb{self.scene_boost:g}"
+        if self.accel:
+            s += f"_acc{self.accel:g}"
+            for name, default in (("accel_zero_p", 0.3), ("accel_min", 2e-3), ("accel_horizon", 180.0)):
+                value = getattr(self, name)
+                if value != default:
+                    s += f"_{name}{value:g}"
         return s
 
     def to_dict(self):
@@ -161,6 +184,37 @@ def _randint(gen, lo, hi, shape):
     return torch.floor(lo + u * (hi - lo + 1)).clamp(max=hi)
 
 
+@torch.no_grad()
+def sample_acceleration(gen, shape, cfg, *, return_stats=False):
+    """Joint rejection of continuous v0 and acceleration; shape excludes xy.
+
+    Redraw BOTH v0 and a for rejected digits. Bounds at the two time endpoints
+    imply the componentwise bound throughout the horizon, independent of dt.
+    Stats count every proposal, including replacements. No RNG is consumed for
+    acceleration when disabled (the legacy velocity sampler remains in make_batch).
+    """
+    if not cfg.accel:
+        raise ValueError("sample_acceleration requires accel > 0")
+    n = math.prod(shape)
+    vel, acc = torch.empty(n, 2), torch.empty(n, 2)
+    pending = torch.arange(n)
+    proposals = 0
+    while pending.numel():
+        count = pending.numel()
+        v = _uniform(gen, (count, 2), -cfg.vmax, cfg.vmax)
+        zero = torch.rand(count, generator=gen) < cfg.accel_zero_p
+        mag = _uniform(gen, (count,), math.log(cfg.accel_min), math.log(cfg.accel)).exp()
+        angle = _uniform(gen, (count,), 0, 2 * math.pi)
+        a = mag[:, None] * torch.stack([angle.cos(), angle.sin()], -1)
+        a[zero] = 0
+        ok = ((v + cfg.accel_horizon * a).abs() <= cfg.vmax).all(-1)
+        vel[pending[ok]], acc[pending[ok]] = v[ok], a[ok]
+        pending = pending[~ok]
+        proposals += count
+    result = (vel.reshape(*shape, 2), acc.reshape(*shape, 2))
+    return (*result, dict(accepted=n, proposals=proposals, acceptance=n / proposals)) if return_stats else result
+
+
 def in_view_mask(cent, half, cam, world, win):
     """Does the digit ink bbox overlap the camera window (torus)? cent/half/cam [...,2] -> [...] bool."""
     rel = torch.remainder(cent - cam, world)
@@ -203,7 +257,11 @@ def make_batch(B, T_obs, T_pred, cfg: EnvConfig, device="cpu", gen=None, split="
         if cfg.real_velocity:
             return _uniform(gen, shape, -cfg.vmax, cfg.vmax)
         return _randint(gen, -cfg.vmax, cfg.vmax, shape)
-    vel = draw_v((B, nd, 2))
+    if cfg.accel:
+        vel, acc = sample_acceleration(gen, (B, nd), cfg)
+    else:
+        vel = draw_v((B, nd, 2))
+        acc = torch.zeros(B, nd, 2)
     if cfg.v_ring:
         assert cfg.v_ring < cfg.vmax
         bad = vel.abs().amax(-1) <= cfg.v_ring                              # [B,nd]
@@ -265,27 +323,60 @@ def make_batch(B, T_obs, T_pred, cfg: EnvConfig, device="cpu", gen=None, split="
     cents = torch.zeros(B, T, nd, 2)
     vels = torch.zeros(B, T, nd, 2)
     bounce = torch.zeros(B, T, nd, dtype=torch.bool)
-    c, v = cent.clone(), vel.clone()
-    for t in range(T):
-        if t > 0:
-            c = c + v * dt
-            if cfg.walls:
-                below, above = c < lo, c > hi
-                c = torch.where(below, 2 * lo - c, c)
-                c = torch.where(above, 2 * hi - c, c)
-                flip = below | above
-                v = torch.where(flip, -v, v)
-                bounce[:, t] = flip.any(-1)
-            else:
-                c = torch.remainder(c, W)
-        cents[:, t] = c
-        vels[:, t] = v
+    if cfg.accel:
+        # Evaluate in float64 before wrapping: cancellation at long horizons
+        # otherwise loses >1e-5 pixels in fp32. Stored trajectories stay fp32.
+        time = tt.double()[None, :, None, None]
+        cents = cent.double()[:, None] + vel.double()[:, None] * time + 0.5 * acc.double()[:, None] * time.square()
+        cents[:, 1:] = cents[:, 1:].remainder(W)
+        cents = cents.float()
+        vels = (vel.double()[:, None] + acc.double()[:, None] * (time + dt / 2)).float()
+    else:
+        c, v = cent.clone(), vel.clone()
+        for t in range(T):
+            if t > 0:
+                c = c + v * dt
+                if cfg.walls:
+                    below, above = c < lo, c > hi
+                    c = torch.where(below, 2 * lo - c, c)
+                    c = torch.where(above, 2 * hi - c, c)
+                    flip = below | above
+                    v = torch.where(flip, -v, v)
+                    bounce[:, t] = flip.any(-1)
+                else:
+                    c = torch.remainder(c, W)
+            cents[:, t] = c
+            vels[:, t] = v
 
     visible = in_view_mask(cents, half[:, None], cam[:, :, None], W, win)  # [B,T,nd]
     ev = bounce.nonzero()                                                  # [E,3] (b,t,d)
     bounce_events = torch.stack([ev[:, 0], ev[:, 2], ev[:, 1],
                                  visible[ev[:, 0], ev[:, 1], ev[:, 2]].long()], 1) if len(ev) else torch.zeros(0, 4, dtype=torch.long)
 
+    frames, worlds = render_digits(patch, cents - off[:, None], cam, cfg, device, return_world)
+    camd = cam.to(device)
+    extra = dict(world=worlds.clamp(0, 1)) if return_world else {}
+
+    return dict(**extra,
+        frames=frames,
+        actions=actions.to(device),
+        actions_noisy=noisy.to(device),
+        bounce=bounce.to(device),
+        bounce_events=bounce_events,
+        digit_states=dict(cent=cents.to(device), vel=vels.to(device), half=half.to(device),
+                          cam=camd, visible=visible.to(device), acc=acc.to(device)),
+        cfg=cfg.to_dict(),
+        scene_boost=sb.to(device),
+    )
+
+
+def render_digits(patch, pos, cam, cfg, device="cpu", return_world=False):
+    """Shared exact renderer: Fourier-placed digits, MAX composition, real camera.
+
+    patch [B,nd,28,28], pos [B,T,nd,2] patch top-left, cam [B,T,2].
+    """
+    B, T, nd = pos.shape[:3]
+    W, win = cfg.world, cfg.window
     # ---- rendering on device ----
     patch = patch.to(device)
     canvas = torch.zeros(B, nd, W, W, device=device)
@@ -298,7 +389,7 @@ def make_batch(B, T_obs, T_pred, cfg: EnvConfig, device="cpu", gen=None, split="
         interior[1:W - 1, 1:W - 1] = 1
         wall = torch.zeros(W, W, device=device)
         wall[0, :] = wall[-1, :] = wall[:, 0] = wall[:, -1] = 0.5
-    pos = (cents - off[:, None]).to(device)                                # patch top-left [B,T,nd,2]
+    pos = pos.to(device)
     camd = cam.to(device)
     frames = torch.zeros(B, T, 1, win, win, device=device)
     worlds = torch.zeros(B, T, 1, W, W, device=device) if return_world else None
@@ -314,19 +405,7 @@ def make_batch(B, T_obs, T_pred, cfg: EnvConfig, device="cpu", gen=None, split="
         view = _fourier_shift(world, -camd[:, t])
         frames[:, t, 0] = view[:, :win, :win]
     frames = frames.clamp(0, 1)
-    extra = dict(world=worlds.clamp(0, 1)) if return_world else {}
-
-    return dict(**extra,
-        frames=frames,
-        actions=actions.to(device),
-        actions_noisy=noisy.to(device),
-        bounce=bounce.to(device),
-        bounce_events=bounce_events,
-        digit_states=dict(cent=cents.to(device), vel=vels.to(device), half=half.to(device),
-                          cam=camd, visible=visible.to(device)),
-        cfg=cfg.to_dict(),
-        scene_boost=sb.to(device),
-    )
+    return frames, worlds
 
 
 def subsample(batch, k):
@@ -342,6 +421,10 @@ def subsample(batch, k):
     ds = batch["digit_states"]
     out["digit_states"] = dict(cent=ds["cent"][:, ::k], vel=ds["vel"][:, ::k], half=ds["half"],
                                cam=ds["cam"][:, ::k], visible=ds["visible"][:, ::k])
+    if "acc" in ds:
+        out["digit_states"]["acc"] = ds["acc"]
+        if batch["cfg"].get("accel", 0):
+            out["digit_states"]["vel"] = out["digit_states"]["vel"] + ds["acc"][:, None] * ((k - 1) * batch["cfg"]["dt"] / 2)
     T = batch["frames"].shape[1]
     b = batch["bounce"]
     # a bounce in (t-k, t] is attributed to subsampled frame t/k

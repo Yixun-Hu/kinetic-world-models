@@ -140,3 +140,15 @@ results/    figures and the numbers used in the documents
 `tests/reference/flowm_models_2d.py` is the authors' file, kept under its MIT
 license for the equivalence test. Everything else is MIT licensed, see
 `LICENSE`.
+
+Opt-in acceleration experiments are described in [PR2](docs/PR2_order2.md).
+
+- `--accel A`: maximum acceleration magnitude in px/frame²; default `0` disables it; incompatible with walls.
+- `--accel_zero_p P`: proposal probability of zero acceleration, default `0.3`.
+- `--accel_min A`: smallest nonzero proposed acceleration, default `0.002`.
+- `--accel_horizon H`: speed-bound horizon in time units, default `180`.
+- `--order {1,2}`: node motion order, default `1`; order 2 requires adaptive lock nodes; eval can override it.
+- `--accel_kappa K`: gate strength, default `9`; `inf` closes the gate; eval can override it.
+- `--accel_var_inflation I`: slope-variance inflation, default `4`; the requested null calibration remains above 2%.
+- `--nu_forget F`: evidence retention per lock update, default `1`; eval can override it.
+- `--pred_shrink {learned,none}`: prediction velocity shrinkage, default `none`; learned sigmoid starts at `0.999`.

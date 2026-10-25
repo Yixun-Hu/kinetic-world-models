@@ -153,3 +153,38 @@ Need the runs of Sections 1, 2 and 4 under `runs/` (`flowm_official_real_both`, 
 python scripts/qual_figs.py        # qual_rollout.png, mse_vs_horizon.png, qual_table.json
 python scripts/panorama_figs.py    # panorama*.png, velocity_space*.png, rollout*.gif, panorama_meta.json
 ```
+
+## PR2: acceleration law and second-order estimator
+
+These are CPU diagnostics with the existing dependencies. MNIST must already be
+available under `data/`. The law and ceiling use the production sampler and renderer.
+
+```bash
+CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+  python scripts/accel_law.py --accel 2e-2 --n 400000 --ceiling \
+  --out results/order2_gate/accel_law.json
+CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+  python scripts/estimator_gate.py --accel 2e-2 --n 100 --seed 777 --batch-size 2
+CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 python -m pytest -q
+CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 KWM_SLOW=1 python -m pytest -q
+```
+
+The gate writes `results/order2_gate/{null,detection,synthetic,summary}.json` and
+`docs/GATE_order2.md`. Its default setting is a documented conservative fallback:
+none of inflation 1, 2, or 4 passed the specified 2% null target at κ=9. The
+single-digit check keeps its digit visible using a real camera moving at v0 plus
+uniform jitter in [-0.25,0.25]²; the 100-sequence null/detection sets retain the
+standard random camera. `--reuse-null` reuses a compatible completed calibration;
+`--reuse` reuses calibration and detection and refreshes the single-digit check.
+
+Example training and evaluation (not run for this PR):
+
+```bash
+python -m kwm.train --model adaptive --node_update lock --order 2 \
+  --real_velocity --real_camera --accel .02 --out runs/order2_s0
+python -m kwm.eval --run runs/order2_s0 --ckpt last --test_seed 777
+python -m kwm.eval --run runs/order2_s0 --ckpt last --test_seed 777 \
+  --order 1 --nu_forget .95 --tag forget095
+python -m kwm.eval --run runs/order2_s0 --ckpt last --test_seed 777 \
+  --accel_kappa inf --tag gate_closed
+```

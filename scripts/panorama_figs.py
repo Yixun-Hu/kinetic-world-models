@@ -61,6 +61,7 @@ def find_reentry(vis, T_obs):
 def run_model(model, fr, an, T_obs, T_pred):
     """Re-implements KineticWM._forward (no walls, no collision) recording the memory map and the adaptive nodes.
     Returns preds [B,T_pred,1,win,win], mem [B,T,W,W] (ego frame), nodes [B,T_obs,V,2] or None."""
+    model._dt = 1.0  # this helper always renders the unit-time rollout
     h = model.initial_state(fr[:, 0])
     mems, nodes, preds = [], [], []
     adaptive = model.kind == "adaptive"
@@ -69,13 +70,13 @@ def run_model(model, fr, an, T_obs, T_pred):
         h, _ = model.step(fr[:, t], h, an[:, t], 1.0, None)
         mems.append(feat(h))
         if adaptive:
-            nodes.append(model.nodes()[None].float() + model.cell.offsets(h))
+            nodes.append(model.diagnostic_velocity(h))
     if adaptive and not model.node_update_pred:
         model.cell.update_nodes = False
     prev = fr[:, T_obs - 1]
     for k in range(T_pred):
         frame = torch.zeros_like(prev) if model.dec_input == "zero" else prev
-        h, _ = model.step(frame, h, an[:, T_obs + k], 1.0, None)
+        h, _ = model.step(frame, h, an[:, T_obs + k], 1.0, None, prediction=True)
         model._rel = an[:, T_obs + k] if model.readout_rel else None
         out = model.decode(h)
         preds.append(out); mems.append(feat(h)); prev = out

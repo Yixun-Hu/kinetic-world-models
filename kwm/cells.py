@@ -10,11 +10,14 @@ KineticCell      same recurrence, but streaming + ego motion is one spectral pha
 AdaptiveNodeCell KineticCell with per-sequence node velocities nu_i(t) = lattice_i + rho_i(t),
                  estimated online from the observations (see the class docstring).
 """
+import math
+
 import torch
 import torch.nn as nn
 
 from .transport import stream, lk_displacement
-from .lock_nodes import LockState, lock_measurement
+from .lock_nodes import (LockState, lock_measurement, NODE_DIM, CORR, TIME, MT,
+                         acceleration_fit, accumulate_acceleration, corrected_offsets, transport_velocity)
 
 
 def _fixed_projection(C, K, seed=1234):
@@ -111,7 +114,7 @@ class AdaptiveNodeCell(_Base):
     self.last_nodes keeps nu_i(t+1) for diagnostics.
 
     node_update='lock' uses LockState(features, nodes, snapshot), with compact
-    fp32 nodes [B,V,4] (rho_x, rho_y, evidence, lock) and one fp32 observed
+    fp32 nodes [B,V,17] (PR1 prefix plus detached fit/carry) and one fp32 observed
     snapshot [B,K,win,win] per sample. gamma affects only the LK imprint bank.
     See lock_nodes.py and PR1_lock_nodes.md.
     """
@@ -120,7 +123,8 @@ class AdaptiveNodeCell(_Base):
 
     def __init__(self, in_ch=1, C=64, world=50, window=32, num_v=25, spacing=1.0, imprint_k=8, gamma=0.9,
                  lam_rel=1e-2, tr_rel=0.1, gate=0.6, bound=0.75, coh_rel=0.5, step_clip=0.3, s_init=1.0,
-                 node_update="lk"):
+                 node_update="lk", order=1, accel_kappa=9., accel_var_inflation=4.,
+                 nu_forget=1., pred_shrink="none"):
         super().__init__(in_ch, C, world, window)
         self.num_v, self.half, self.K_imp = num_v, spacing / 2, imprint_k
         self.gamma, self.lam_rel, self.tr_rel, self.gate = gamma, lam_rel, tr_rel, gate
@@ -131,7 +135,19 @@ class AdaptiveNodeCell(_Base):
         self.update_nodes = True
         if node_update not in ("lk", "lock"):
             raise ValueError("node_update must be lk or lock")
-        self.node_update = node_update
+        if order not in (1, 2) or (order == 2 and node_update != "lock"):
+            raise ValueError("--order 2 requires --node_update lock")
+        if not 0 < nu_forget <= 1 or pred_shrink not in ("none", "learned"):
+            raise ValueError("nu_forget must be in (0,1]; pred_shrink must be none or learned")
+        if node_update != "lock" and (nu_forget != 1 or pred_shrink != "none"):
+            raise ValueError("nu_forget and pred_shrink require --node_update lock")
+        if accel_kappa < 0 or math.isnan(accel_kappa) or not (0 < accel_var_inflation < float('inf')):
+            raise ValueError("invalid acceleration gate parameters")
+        self.node_update, self.order = node_update, order
+        self.accel_kappa, self.accel_var_inflation = accel_kappa, accel_var_inflation
+        self.nu_forget, self.pred_shrink = nu_forget, pred_shrink
+        if pred_shrink == "learned":
+            self.shrink_logit = nn.Parameter(torch.tensor(math.log(.999 / .001)))
 
     def initial_state(self, observation):
         B = observation.shape[0]
@@ -139,7 +155,7 @@ class AdaptiveNodeCell(_Base):
             return observation.new_zeros(B, self.num_v, self.C + self.extra + self.K_imp, self.world, self.world)
         return LockState(
             observation.new_zeros(B, self.num_v, self.C, self.world, self.world),
-            observation.new_zeros(B, self.num_v, 4, dtype=torch.float32),
+            observation.new_zeros(B, self.num_v, NODE_DIM, dtype=torch.float32),
             observation.new_zeros(B, self.K_imp, self.window, self.window, dtype=torch.float32))
 
     def imprint(self, u):
@@ -148,7 +164,7 @@ class AdaptiveNodeCell(_Base):
     def offsets(self, h):
         """rho [B,V,2] from the spatially constant state channels."""
         if isinstance(h, LockState):
-            return h.nodes[..., :2]
+            return corrected_offsets(h.nodes, self.bound) if self.order == 2 else h.nodes[..., :2]
         return h[:, :, self.C:self.C + 2].float().mean((-2, -1))
 
     def bounce(self, h, nodes, perm_x, perm_y, wall, K=28):
@@ -161,7 +177,7 @@ class AdaptiveNodeCell(_Base):
             # snapshot is an observation, not node content to reflect.
             fields = h.nodes[..., None, None].expand(-1, -1, -1, self.world, self.world)
             packed = torch.cat([h.features.float(), fields], 2)
-            bounced = self._bounce_tensor(packed, nodes, perm_x, perm_y, wall, K, 4)
+            bounced = self._bounce_tensor(packed, nodes, perm_x, perm_y, wall, K, h.nodes.shape[-1])
             st = bounced[:, :, self.C:, 0, 0]
             return LockState(bounced[:, :, :self.C].to(h.features.dtype), st, h.snapshot)
         return self._bounce_tensor(h, nodes, perm_x, perm_y, wall, K, self.extra)
@@ -170,6 +186,8 @@ class AdaptiveNodeCell(_Base):
         from .collision import rigid_bounce_back
         C, E = self.C, extra
         nu = nodes[None].float() + self.offsets(h)
+        if E == NODE_DIM and self.order == 2:
+            nu = nodes[None].float() + corrected_offsets(h[:, :, C:C + E, 0, 0], self.bound)
         content = torch.cat([h[:, :, :C], h[:, :, C + E:]], 2)
         content, moved = rigid_bounce_back(content, nu, perm_x, perm_y, wall, K=K, return_moved=True)
         st = h[:, :, C:C + E].float().mean((-2, -1))                               # [B,V,E] node state
@@ -177,6 +195,10 @@ class AdaptiveNodeCell(_Base):
         for axis, perm in ((0, perm_x), (1, perm_y)):
             go = (moved[axis] > 0.5 * tot)                                          # [B,V]: node i bounced
             src = st.clone()
+            if E == NODE_DIM:
+                # A bounce is a discontinuity: discard the fit and carried correction.
+                src[..., 4:14] = 0
+                src[..., CORR] = 0
             src[:, :, axis] = -src[:, :, axis]                                      # reflected offset
             tgt = torch.zeros_like(go)
             tgt[:, perm] = go                                                       # targets perm(i) of bounced i
@@ -187,10 +209,10 @@ class AdaptiveNodeCell(_Base):
         fields = st[..., None, None].expand(B, V, E, H, W).to(h.dtype)
         return torch.cat([content[:, :, :C], fields, content[:, :, C:]], 2)
 
-    def forward(self, u_t, h_prev, action, nodes, dt=1.0, collision=None, update_nodes=None):
+    def forward(self, u_t, h_prev, action, nodes, dt=1.0, collision=None, update_nodes=None, prediction=False):
         update_nodes = self.update_nodes if update_nodes is None else update_nodes
         if self.node_update == "lock":
-            return self._forward_lock(u_t, h_prev, action, nodes, dt, collision, update_nodes)
+            return self._forward_lock(u_t, h_prev, action, nodes, dt, collision, update_nodes, prediction)
         C, K, E = self.C, self.K_imp, self.extra
         if collision is not None:                       # wall bounce on the adaptive nodes
             h_prev = collision(h_prev)
@@ -229,29 +251,68 @@ class AdaptiveNodeCell(_Base):
                                m_new[:, :, :, win:]], 3)
         return torch.cat([h_new, fields.to(h_new.dtype), m_new.to(h_new.dtype)], 2)
 
-    def _forward_lock(self, u_t, h_prev, action, nodes, dt, collision, update_nodes):
+    def lock_update(self, previous, pu, state, action, nodes, dt=1., update_nodes=True, prediction=False):
+        """Production estimator, shared with the CPU gate harness (no feature recurrence)."""
+        # PR1 mean and measurement arithmetic is deliberately kept separate from
+        # the additive acceleration correction. Prediction consumes the same
+        # measurements as PR1; only its carried correction advances.
+        nu = nodes[None].float() + state[..., :2]
+        if update_nodes:
+            measurement = lock_measurement(
+                previous, pu, nu, nodes, action, self.world, dt,
+                self.lam_rel, self.tr_rel, self.gate, self.coh_rel, self.bound,
+                return_mode=self.order == 2 and not prediction)
+            delta, evidence, locked = measurement[:3]
+            W = state[..., 2:3]
+            if self.nu_forget != 1.:
+                W = W * self.nu_forget
+            W_new = W + evidence[..., None]
+            gain = evidence[..., None] / W_new.clamp_min(1e-6)
+            residual = (nu + delta / dt) - nu
+            step = (self.n_s * gain * residual).clamp(-self.step_clip, self.step_clip)
+            rho_new = (nu - nodes[None].float() + step).clamp(-self.bound, self.bound)
+            prefix = torch.cat([rho_new, W_new, locked[..., None]], -1)
+        else:
+            prefix = state[..., :4]
+        extra = state[..., 4:]
+        if self.order == 2 and self.accel_kappa != float("inf"):
+            if not prediction and update_nodes:
+                # At frame t, the measured displacement spans [t-dt,t].
+                # Centre its timestamp so the correction represents v(t),
+                # and transport_velocity represents the mean over [t,t+dt].
+                fitted = accumulate_acceleration(state, nu + delta / dt, evidence,
+                                                  state[..., TIME] - dt / 2, locked, measurement[3])
+                slope, gate, _, _ = acceleration_fit(fitted, self.accel_kappa, self.accel_var_inflation)
+                fitted[..., CORR] = gate[..., None] * slope * (state[..., TIME] - fitted[..., MT])[..., None]
+                fitted[..., TIME] = state[..., TIME] + dt
+                extra = fitted[..., 4:]
+            elif prediction:
+                slope, gate, _, _ = acceleration_fit(state, self.accel_kappa, self.accel_var_inflation)
+                extra = torch.cat([state[..., 4:15], state[..., CORR] + gate[..., None] * slope * dt], -1)
+        return torch.cat([prefix, extra], -1)
+
+    def prediction_state(self, state, nodes):
+        if self.pred_shrink == "none":
+            return state
+        factor = self.shrink_logit.sigmoid()
+        rho = ((nodes[None].float() + state[..., :2]) * factor - nodes[None].float()).clamp(-self.bound, self.bound)
+        return torch.cat([rho, state[..., 2:15], state[..., CORR] * factor], -1)
+
+    def _forward_lock(self, u_t, h_prev, action, nodes, dt, collision, update_nodes, prediction):
         if collision is not None:
             h_prev = collision(h_prev)
-        rho = self.offsets(h_prev)
+        state = self.prediction_state(h_prev.nodes, nodes) if prediction else h_prev.nodes
         with torch.autocast(device_type=u_t.device.type, enabled=False):
-            nu = nodes[None].float() + rho
+            nu = nodes[None].float() + state[..., :2]
+            if self.order == 2:
+                nu = transport_velocity(state, nodes, dt, self.accel_kappa, self.accel_var_inflation, self.bound)
             feat = stream(h_prev.features, nu, action.float(), dt)
+        pu = h_prev.snapshot
         if update_nodes:
             u = self.conv_u(u_t)
             with torch.autocast(device_type=u_t.device.type, enabled=False):
                 pu = self.imprint(u.float())
-                delta, evidence, locked = lock_measurement(
-                    h_prev.snapshot, pu, nu, nodes, action, self.world, dt,
-                    self.lam_rel, self.tr_rel, self.gate, self.coh_rel, self.bound)
-                W_new = h_prev.nodes[..., 2:3] + evidence[..., None]
-                gain = evidence[..., None] / W_new.clamp_min(1e-6)
-                # Form the residual from the measured velocity in fp32.
-                residual = (nu + delta / dt) - nu
-                step = (self.n_s * gain * residual).clamp(-self.step_clip, self.step_clip)
-                rho_new = (nu - nodes[None].float() + step).clamp(-self.bound, self.bound)
-                state = torch.cat([rho_new, W_new, locked[..., None]], -1)
-        else:
-            state, pu = h_prev.nodes, h_prev.snapshot
-        # Use the existing feature recurrence, independent of estimator state.
+        with torch.autocast(device_type=u_t.device.type, enabled=False):
+            state = self.lock_update(h_prev.snapshot, pu, state, action, nodes, dt, update_nodes, prediction)
         h_new = self.act(self.lift(u_t, self.num_v) + self.mix(feat))
         return LockState(h_new, state, pu)
