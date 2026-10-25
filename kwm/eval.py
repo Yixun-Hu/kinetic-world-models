@@ -259,7 +259,7 @@ def main(argv=None):
     p.add_argument("--ckpt", default="best", help="checkpoint basename in the run dir: best | last | ckpt_step2000 ...")
     p.add_argument("--n_val", type=int, default=None, help="default: the run's --n_val")
     p.add_argument("--test_seed", type=int, default=None,
-                   help="main rollout cache seed (default: selection seed 12345)")
+                   help="main and fractional-time cache seed (default: selection seed 12345)")
     p.add_argument("--bs", type=int, default=50)
     # the run's preset (T_obs, C, n_val, ...) is read from its checkpoint args
     p.add_argument("--device", default=None)
@@ -303,12 +303,12 @@ def main(argv=None):
     n_val = a.n_val or args.get("n_val", 1000)
     cfg = env_cfg_from_args(args, split="val")
     test_seed = VAL_SEED if a.test_seed is None else a.test_seed
-    sfx = (f"_seed{test_seed}" if test_seed != VAL_SEED else "") + (f"_{a.tag}" if a.tag else "")
+    sfx = (f"_seed{test_seed}_{a.ckpt}" if test_seed != VAL_SEED else "") + (f"_{a.tag}" if a.tag else "")
     W, win, band = cfg.world, cfg.window, args.get("wall_band", 3)
     cache = val_cache(cfg, n_val, T_obs=args.get("t_obs", VAL_T_OBS), device=device, seed=test_seed)
     T_obs, T_pred = args.get("t_obs", VAL_T_OBS), VAL_T_PRED
     kinetic = args["model"] != "flowm"
-    provenance = dict(source_hashes(), env=env_fingerprint(cfg))
+    provenance = dict(source_hashes(), eval_env=env_fingerprint(cfg))
     if ckpt_provenance is not None and ckpt_provenance.get("files") != provenance["files"]:
         print("[kwm] WARNING: evaluation source file hashes differ from checkpoint provenance.")
     res = dict(run=name, ckpt=a.ckpt, step=step, model=args["model"], params=count_params(model),
@@ -316,7 +316,8 @@ def main(argv=None):
                test_seed=test_seed, provenance=provenance, ckpt_provenance=ckpt_provenance, sets={},
                node_update_pred=getattr(model, "node_update_pred", None),
                readout_rel=getattr(model, "readout_rel", None))
-    cache_set = dict(seed=test_seed, split="test", n=n_val, t_obs=T_obs, t_pred=T_pred, chunk=50)
+    role = "selection" if test_seed == VAL_SEED else "heldout"
+    cache_set = dict(seed=test_seed, mnist_split="test", role=role, n=n_val, t_obs=T_obs, t_pred=T_pred, chunk=50)
 
     # ---------------- adaptive: node velocity error at the end of the observation ----------------
     if args["model"] == "adaptive" and not cfg.walls:
@@ -328,7 +329,7 @@ def main(argv=None):
 
     # ---------------- boost equivariance of the memory / of the predictions ----------------
     if a.equiv_boost or (a.only_equiv and not a.equiv_boost_output):
-        res["sets"]["equiv"] = dict(seed=777, split="test", n=a.n_equiv, chunk=16,
+        res["sets"]["equiv"] = dict(seed=777, mnist_split="test", role="heldout", n=a.n_equiv, chunk=16,
                                      sequence_seed="seed * 1000 + chunk_start")
         res["equiv"] = equiv_memory(model, args, cfg, a.n_equiv, device)
         if args["model"] == "adaptive" and isinstance(res["equiv"], dict) and "comoving_off" in res["equiv"]:
@@ -336,7 +337,7 @@ def main(argv=None):
                                     "by either of two neighbouring nodes; see equiv_output for the gauge-free check")
         print("[equiv]", json.dumps(res["equiv"]))
     if a.equiv_boost or a.equiv_boost_output:
-        res["sets"]["equiv_output"] = dict(seed=777, split="test", n=a.n_equiv, chunk=16,
+        res["sets"]["equiv_output"] = dict(seed=777, mnist_split="test", role="heldout", n=a.n_equiv, chunk=16,
                                             sequence_seed="seed * 1000 + chunk_start")
         res["equiv_output"] = equiv_output(model, args, cfg, a.n_equiv, device)
         print("[equiv-output]", json.dumps(res["equiv_output"]))
@@ -344,15 +345,16 @@ def main(argv=None):
         path = os.path.join(out_dir, f"eval{sfx}.json")
         old = json.load(open(path)) if os.path.exists(path) else {}
         old.update({k: v for k, v in res.items() if k in ("equiv", "equiv_output")})
-        old.setdefault("sets", {}).update(res["sets"])
         # A merged file may contain metrics from an earlier invocation. Keep their
         # provenance, and identify the invocation that produced each new diagnostic.
+        diagnostic_keys = ("provenance", "ckpt_provenance", "seed", "test_seed", "sets")
         for key in ("equiv", "equiv_output"):
             if key in res:
                 old.setdefault("diagnostic_provenance", {})[key] = dict(
-                    provenance=provenance, ckpt_provenance=ckpt_provenance, ckpt=a.ckpt, step=step)
+                    {k: res[k] for k in diagnostic_keys}, ckpt=a.ckpt, step=step)
         for k, v in res.items():
-            old.setdefault(k, v)
+            if k not in diagnostic_keys:
+                old.setdefault(k, v)
         with open(path, "w") as f:
             json.dump(old, f, indent=1)
         return
@@ -453,9 +455,9 @@ def main(argv=None):
     if not a.skip_ft:
         cfg_h = EnvConfig(**dict(cfg.to_dict(), dt=0.5))
         Th_obs, Th_pred = 2 * T_obs, 40
-        res["sets"]["fractional_time"] = dict(seed=VAL_SEED, split="test", n=n_val,
+        res["sets"]["fractional_time"] = dict(seed=test_seed, mnist_split="test", role=role, n=n_val,
                                                 t_obs=Th_obs, t_pred=Th_pred, dt=0.5, chunk=50)
-        ch = val_cache(cfg_h, n_val, T_obs=Th_obs, T_pred=Th_pred, device=device)
+        ch = val_cache(cfg_h, n_val, T_obs=Th_obs, T_pred=Th_pred, device=device, seed=test_seed)
         ft = {"model_dt05": [], "copy": [], "interp": [], "dt1_even": []}
         for i in range(0, n_val, a.bs):
             sl = slice(i, i + a.bs)
@@ -556,7 +558,9 @@ def main(argv=None):
         for r in range(2):
             axs[r, c].axis("off")
     fig.tight_layout(); fig.savefig(os.path.join(out_dir, f"samples{sfx}.png"), dpi=120); plt.close(fig)
-    print(json.dumps({k: v for k, v in res.items() if k not in ("mse_curve", "fractional_time")}, indent=1))
+    print(json.dumps({k: v for k, v in res.items()
+                      if not k.startswith("per_seq_")
+                      and k not in ("mse_curve", "fractional_time", "provenance", "ckpt_provenance")}, indent=1))
 
 
 if __name__ == "__main__":

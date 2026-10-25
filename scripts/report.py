@@ -1,16 +1,18 @@
 """Paired multi-seed evaluation reports, using only the existing numpy dependency.
 
-python scripts/report.py --arm lk 'results/lk_s*/eval_seed777.json' \
-    --arm lock 'results/lock_s*/eval_seed777.json' --pairs lk:lock --holm
+python scripts/report.py --arm lk 'results/lk_s*/eval_seed777_last.json' \
+    --arm lock 'results/lock_s*/eval_seed777_last.json' --pairs lk:lock --holm
 """
 import argparse
 import glob
+import hashlib
 import itertools
 import json
 import math
-from pathlib import Path
+import re
 import sys
 import warnings
+from pathlib import Path
 
 import numpy as np
 
@@ -108,8 +110,11 @@ def _scalar(record, metric):
 
 def pair_records(comparator, treatment):
     """Pair by training seed, requiring equal seed sets; legacy inputs use file order."""
-    if any(r.get("seed") is None for r in comparator + treatment):
-        warnings.warn("missing seed: pairing by file order (explicit lists, sorted within each glob)", stacklevel=2)
+    missing = [r.get("seed") is None for r in comparator + treatment]
+    if any(missing) and not all(missing):
+        raise ValueError("training seeds are present in some records and missing in others")
+    if all(missing):
+        warnings.warn("missing seed: pairing by file order (explicit lists, naturally sorted within each glob)", stacklevel=2)
         if len(comparator) != len(treatment):
             raise ValueError("file-order pairing requires equal arm lengths")
         return comparator, treatment, "file_order"
@@ -131,6 +136,40 @@ def pair_records(comparator, treatment):
     return list(left.values()), [right[s] for s in left], "seed"
 
 
+def _evaluation_metadata(record):
+    """Legacy JSON has an env config but no provenance or explicit test seed."""
+    for key in ("n_val", "env", "ckpt"):
+        if record.get(key) is None:
+            raise ValueError(f"{record.get('_path', 'record')}: missing {key}")
+    canonical = json.dumps(record["env"], sort_keys=True, separators=(",", ":"),
+                           ensure_ascii=False, allow_nan=False)
+    return dict(test_seed=12345 if record.get("test_seed") is None else record["test_seed"],
+                n_val=record["n_val"], ckpt=record["ckpt"],
+                env_sha256=hashlib.sha256(canonical.encode("utf-8")).hexdigest())
+
+
+def _validate_evaluations(records, label):
+    common = _evaluation_metadata(records[0])
+    main_set = None
+    for record in records:
+        metadata = _evaluation_metadata(record)
+        for key in common:
+            if metadata[key] != common[key]:
+                raise ValueError(f"{label}: evaluations have different {key}")
+        current = record.get("sets", {}).get("main")
+        if current is not None:
+            # The old 'split' field named the MNIST split; role is a new label.
+            current = dict(current)
+            current.pop("role", None)
+            split = current.pop("split", None)
+            if split is not None:
+                current.setdefault("mnist_split", split)
+            if main_set is not None and current != main_set:
+                raise ValueError(f"{label}: evaluations have different main set definitions")
+            main_set = current
+    return common
+
+
 def _sequence_differences(left, right, metric):
     key = f"per_seq_{metric}"
     a, b = left.get(key), right.get(key)
@@ -139,13 +178,6 @@ def _sequence_differences(left, right, metric):
     a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
     if a.ndim != 1 or b.shape != a.shape or not a.size or not np.isfinite(a).all() or not np.isfinite(b).all():
         raise ValueError(f"{key}: paired sequence lists must be nonempty, finite, and equally sized")
-    # Index-wise resampling is paired only when both results evaluated the same scenes.
-    for key in ("test_seed", "n_val", "env"):
-        if key in left and key in right and left[key] != right[key]:
-            raise ValueError(f"paired sequences have different {key}")
-    left_set, right_set = left.get("sets", {}).get("main"), right.get("sets", {}).get("main")
-    if left_set is not None and right_set is not None and left_set != right_set:
-        raise ValueError("paired sequences have different main set definitions")
     for record, values in ((left, a), (right, b)):
         if record.get("n_val", len(values)) != len(values):
             raise ValueError(f"per_seq_{metric} length differs from n_val")
@@ -178,8 +210,27 @@ def bootstrap_interval(comparator, treatment, metric, replicates=2000, seed=0):
 def build_report(arms, pairs, metrics=("mse20", "mse150"), holm=False):
     if not arms or any(not records for records in arms.values()):
         raise ValueError("each arm requires at least one evaluation")
+    # Validate every arm and every requested pair before computing any statistics,
+    # including scalar-only metrics and comparisons involving legacy JSON.
+    evaluations = {}
+    for name, records in arms.items():
+        missing = [r.get("seed") is None for r in records]
+        if any(missing) and not all(missing):
+            raise ValueError("training seeds are present in some records and missing in others")
+        if any(r.get("test_seed") is None for r in records):
+            warnings.warn(f"arm {name}: missing test_seed in legacy JSON implies 12345 (selection set)", stacklevel=2)
+        elif any(r["test_seed"] == 12345 for r in records):
+            warnings.warn(f"arm {name}: scores on the selection set (test_seed=12345)", stacklevel=2)
+        evaluations[name] = _validate_evaluations(records, f"arm {name}")
+    paired = []
+    for pair in pairs:
+        names = pair.split(":")
+        if len(names) != 2 or any(name not in arms for name in names) or names[0] == names[1]:
+            raise ValueError(f"invalid comparator:treatment pair: {pair}")
+        _validate_evaluations(arms[names[0]] + arms[names[1]], f"pair {pair}")
+        paired.append((pair, *pair_records(arms[names[0]], arms[names[1]])))
     report = dict(metrics={}, comparisons=[], bootstrap=dict(replicates=2000, seed=0),
-                  difference="treatment - comparator")
+                  difference="treatment - comparator", evaluations=evaluations)
     for metric in metrics:
         summaries = {}
         for name, records in arms.items():
@@ -189,11 +240,7 @@ def build_report(arms, pairs, metrics=("mse20", "mse150"), holm=False):
                                    mean=float(np.mean(values)), sd=float(np.std(values, ddof=1)) if len(values) > 1 else None,
                                    n=len(values))
         report["metrics"][metric] = summaries
-    for pair in pairs:
-        names = pair.split(":")
-        if len(names) != 2 or any(name not in arms for name in names) or names[0] == names[1]:
-            raise ValueError(f"invalid comparator:treatment pair: {pair}")
-        left, right, pairing = pair_records(arms[names[0]], arms[names[1]])
+    for pair, left, right, pairing in paired:
         for metric in metrics:
             d = [_scalar(b, metric) - _scalar(a, metric) for a, b in zip(left, right)]
             t, p = paired_t(d)
@@ -216,7 +263,10 @@ def markdown(report):
     def fmt(value):
         return "NA" if value is None else f"{value:.8g}"
 
-    lines = []
+    lines = ["Evaluation sets:"]
+    for arm, metadata in report["evaluations"].items():
+        lines.append(f"{arm}: test_seed={metadata['test_seed']}, ckpt={metadata['ckpt']}, n_val={metadata['n_val']}")
+    lines.append("")
     for metric, summaries in report["metrics"].items():
         lines += [f"### {metric}", "", "| Arm | Per-seed values (seed: value) | Mean | SD | n |",
                   "|---|---|---:|---:|---:|"]
@@ -227,8 +277,8 @@ def markdown(report):
         lines.append("")
     if report["comparisons"]:
         holm = "t_p_holm" in report["comparisons"][0]
-        lines += ["Differences are treatment − comparator. Intervals use 2,000 bootstrap replicates (seed 0).", "",
-                  "| Pair | Metric | n | Mean difference | t (df = n−1) | Two-sided p | Exact sign-flip p | Bootstrap 95% CI |"
+        lines += ["Differences are treatment - comparator. Intervals use 2,000 bootstrap replicates (seed 0).", "",
+                  "| Pair | Metric | n | Mean difference | t (df = n-1) | Two-sided p | Exact sign-flip p | Bootstrap 95% CI |"
                   + (" Holm t p | Holm sign-flip p |" if holm else ""),
                   "|---|---|---:|---:|---:|---:|---:|---|" + ("---:|---:|" if holm else "")]
         for c in report["comparisons"]:
@@ -237,7 +287,7 @@ def markdown(report):
                          f"{fmt(c['t_p'])} | {fmt(c['sign_flip_p'])} | [{fmt(lo)}, {fmt(hi)}] |"
                          + (f" {fmt(c['t_p_holm'])} | {fmt(c['sign_flip_p_holm'])} |" if holm else ""))
         lines.append("")
-    return "\n".join(lines)
+    return "\n".join(lines).encode("ascii", "backslashreplace").decode("ascii")
 
 
 def load_arms(manifest=None, cli_arms=()):
@@ -246,11 +296,9 @@ def load_arms(manifest=None, cli_arms=()):
         path = Path(manifest)
         with path.open() as f:
             mapping = json.load(f)
-        if not isinstance(mapping, dict):
-            raise ValueError("manifest must map arm names to lists of paths/globs")
-        mapping = mapping.get("arms", mapping)
-        if not isinstance(mapping, dict):
-            raise ValueError("manifest must map arm names to lists of paths/globs")
+        if not isinstance(mapping, dict) or set(mapping) != {"arms"} or not isinstance(mapping["arms"], dict):
+            raise ValueError('manifest must have the form {"arms": {name: [paths/globs]}}')
+        mapping = mapping["arms"]
         for name, patterns in mapping.items():
             specs.append((name, patterns, path.parent))
     for arm in cli_arms:
@@ -268,7 +316,9 @@ def load_arms(manifest=None, cli_arms=()):
         for pattern in patterns:
             if not isinstance(pattern, str):
                 raise ValueError(f"arm {name}: paths/globs must be strings")
-            matches = sorted(glob.glob(str(base / pattern)))
+            matches = sorted(glob.glob(str(base / pattern)),
+                             key=lambda path: [int(part) if part.isdigit() else part
+                                               for part in re.split(r"([0-9]+)", path)])
             if not matches:
                 raise ValueError(f"arm {name}: no files match {pattern!r}")
             for match in matches:
@@ -295,19 +345,16 @@ def _json_safe(value):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("manifest", nargs="?", help="JSON arm mapping; paths relative to this file")
-    p.add_argument("--manifest", dest="manifest_option")
+    p.add_argument("--manifest", metavar="PATH", help='JSON {"arms": {...}}; paths relative to this file')
     p.add_argument("--arm", action="append", nargs="+", default=[], metavar="NAME_OR_GLOB")
     p.add_argument("--pairs", action="extend", nargs="+", default=[], metavar="COMPARATOR:TREATMENT")
     p.add_argument("--metrics", nargs="+", default=["mse20", "mse150"])
     p.add_argument("--holm", action="store_true")
     p.add_argument("--out", help="also write the Markdown table to this path")
-    p.add_argument("--json", nargs="?", const="-", metavar="PATH", help="write JSON to PATH (omitted or -: stdout)")
+    p.add_argument("--json", metavar="PATH", help="write JSON to PATH (-: stdout)")
     a = p.parse_args(argv)
-    if a.manifest and a.manifest_option:
-        p.error("give the manifest once")
     try:
-        report = build_report(load_arms(a.manifest or a.manifest_option, a.arm), a.pairs, a.metrics, a.holm)
+        report = build_report(load_arms(a.manifest, a.arm), a.pairs, a.metrics, a.holm)
     except (OSError, ValueError) as e:
         p.error(str(e))
     table = markdown(report)

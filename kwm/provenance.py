@@ -2,25 +2,32 @@
 import hashlib
 import json
 import os
-from pathlib import Path
+import platform
 import subprocess
+from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+import numpy as np
+import torch
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def source_hashes():
-    """Hash every Python source under kwm; git metadata is null outside git."""
+    """Hash kwm sources and record software; git metadata is null outside git."""
     files = {p.relative_to(ROOT).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
-             for p in sorted((ROOT / "kwm").rglob("*.py"))}
+             for p in sorted((Path(ROOT) / "kwm").rglob("*.py"))}
     head = dirty = None
     try:
         opts = dict(cwd=ROOT, text=True, stderr=subprocess.DEVNULL,
                     env=dict(os.environ, GIT_OPTIONAL_LOCKS="0"))
         head = subprocess.check_output(["git", "rev-parse", "HEAD"], **opts).strip()
-        dirty = bool(subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=normal"], **opts).strip())
+        dirty = bool(subprocess.check_output(
+            ["git", "status", "--porcelain", "--untracked-files=no", "--", "kwm", "scripts"], **opts).strip())
     except (OSError, subprocess.CalledProcessError):
         head = dirty = None
-    return dict(git_head=head, git_dirty=dirty, files=files)
+    return dict(git_head=head, git_dirty=dirty, files=files,
+                software=dict(python=platform.python_version(), torch=str(torch.__version__),
+                              numpy=np.__version__, cuda_available=torch.cuda.is_available()))
 
 
 def env_fingerprint(cfg):

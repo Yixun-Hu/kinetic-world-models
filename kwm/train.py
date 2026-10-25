@@ -22,9 +22,8 @@ import torch.nn.functional as F
 
 from .env import EnvConfig, make_batch
 from .model import MODELS, COLLISIONS, build_model, count_params, make_wall0, oracle_nodes_from
-from .provenance import source_hashes, env_fingerprint
+from .provenance import ROOT, source_hashes, env_fingerprint
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VAL_SEED = 12345
 VAL_T_OBS, VAL_T_PRED = 30, 150     # validation: T_obs (= the run's --t_obs) observed + 150 predicted frames
 
@@ -212,6 +211,7 @@ def main(argv=None):
     best150 = math.inf
     last = os.path.join(a.out, "last.pt")
     gen = torch.Generator().manual_seed(a.seed)
+    provenance_history = []
     if os.path.exists(last):
         ck = torch.load(last, map_location=device, weights_only=False)
         model.load_state_dict(ck["model"])
@@ -220,10 +220,18 @@ def main(argv=None):
         best150 = ck.get("best150", math.inf)
         gen.set_state(ck["gen_state"].cpu())          # ckpt was loaded with map_location=device
         random.setstate(ck["py_rng"])
+        previous_provenance = ck.get("provenance")
+        if previous_provenance is not None and previous_provenance.get("files") != provenance["files"]:
+            print("[kwm] WARNING: resumed training source file hashes differ from checkpoint provenance.")
+        # Without a history, the checkpoint is the only known provenance boundary.
+        # Null preserves the unknown source of legacy checkpoints rather than guessing it.
+        provenance_history = list(ck.get("provenance_history") or
+                                  [dict(step=step0, provenance=previous_provenance)])
         print(f"[kwm] resumed from step {step0}")
+    provenance_history.append(dict(step=step0, provenance=provenance))
     with open(os.path.join(a.out, "config.json"), "w") as f:
         json.dump(dict(vars(a), n_params=n_params, num_v=model.num_v, env=cfg.to_dict(), device=device,
-                       provenance=provenance), f, indent=1)
+                       provenance=provenance, provenance_history=provenance_history), f, indent=1)
 
     cache = val_cache(vcfg, a.n_val, T_obs=a.t_obs, device=device)
     n_quick = min(a.val_n_quick, a.n_val)
@@ -238,7 +246,7 @@ def main(argv=None):
     def save(path, step):
         torch.save(dict(model=model.state_dict(), opt=opt.state_dict(), step=step, best=best, best150=best150,
                         args=vars(a), gen_state=gen.get_state(), py_rng=random.getstate(),
-                        provenance=provenance), path)
+                        provenance=provenance, provenance_history=provenance_history), path)
 
     model.train()
     t_acc, d_acc, l_acc, n_acc = 0.0, 0.0, 0.0, 0
