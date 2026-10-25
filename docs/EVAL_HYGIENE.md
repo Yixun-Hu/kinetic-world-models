@@ -25,7 +25,17 @@ passing 12345 retains the original cache/output names and metric calculations.
 For any other seed, `val_cache` adds `_seed<seed>` before `.pt`, and evaluation
 adds `_seed<seed>_<ckpt>` before the optional tag in every output filename. The
 cache generator uses the chosen seed. Cache chunking, float16 frame storage, and default cache
-contents are unchanged. JSON and checkpoint metadata are additive.
+tensors are unchanged. JSON and checkpoint metadata are additive.
+
+New validation caches store `seed`, `n`, `T_obs`, `T_pred`, `chunk`, the full `cfg`,
+its `env_sha256`, the generator's `env_source_sha256`, and `mnist_sha256`.
+Loading rejects mismatched generation parameters or configuration hashes with a
+`ValueError` naming the file and field; source changes only warn. Legacy caches
+without self-description still load with one warning and remain unchecked.
+The MNIST hash is captured once per loaded test digit bank from the raw image
+then label file bytes (or torchvision's legacy `test.pt`), or null if unavailable.
+Evaluation copies stored metadata into `sets.main.cache` and
+`sets.fractional_time.cache`, leaving missing legacy fields null.
 
 Both selection and test sequences use the MNIST **test split**. A new seed holds
 out generated trajectories and scenes, not a disjoint pool of digit images.

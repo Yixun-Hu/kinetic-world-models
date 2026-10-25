@@ -25,7 +25,7 @@ import torch.nn.functional as F
 
 from .env import EnvConfig, subsample
 from .model import build_model, count_params, make_wall0, oracle_nodes_from
-from .train import ROOT, VAL_SEED, VAL_T_OBS, VAL_T_PRED, val_cache, env_cfg_from_args
+from .train import ROOT, VAL_SEED, VAL_T_OBS, VAL_T_PRED, val_cache, val_cache_description, env_cfg_from_args
 from .provenance import source_hashes, env_fingerprint
 
 COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4"]
@@ -360,7 +360,7 @@ def main(argv=None):
         return
 
     # ---------------- main rollout (150 frames) ----------------
-    res["sets"]["main"] = cache_set
+    res["sets"]["main"] = dict(cache_set, cache=val_cache_description(cache))
     mse_f, psnr_f, ssim_f = [], [], []       # [N, T_pred] each
     bounce_rows, ctrl_rows, vel_rows = [], [], []
     sample = None
@@ -458,6 +458,7 @@ def main(argv=None):
         res["sets"]["fractional_time"] = dict(seed=test_seed, mnist_split="test", role=role, n=n_val,
                                                 t_obs=Th_obs, t_pred=Th_pred, dt=0.5, chunk=50)
         ch = val_cache(cfg_h, n_val, T_obs=Th_obs, T_pred=Th_pred, device=device, seed=test_seed)
+        res["sets"]["fractional_time"]["cache"] = val_cache_description(ch)
         ft = {"model_dt05": [], "copy": [], "interp": [], "dt1_even": []}
         for i in range(0, n_val, a.bs):
             sl = slice(i, i + a.bs)
