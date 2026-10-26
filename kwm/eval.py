@@ -24,7 +24,8 @@ import torch
 import torch.nn.functional as F
 
 from .env import EnvConfig, subsample
-from .model import build_model, count_params, make_wall0, oracle_nodes_from
+from .model import build_model, count_params, make_wall0, oracle_nodes_from, DEC_INPUTS, FROZEN_INPUTS
+from .diagnostics import digit_masks, prediction_truth, concentration_summary
 from .train import ROOT, VAL_SEED, VAL_T_OBS, VAL_T_PRED, val_cache, val_cache_description, env_cfg_from_args
 from .provenance import source_hashes, env_fingerprint
 
@@ -57,20 +58,8 @@ def ci95(a):
     return float(a.mean()), float(1.96 * a.std(ddof=1) / math.sqrt(len(a)))
 
 
-def digit_masks(cent, half, cam, world, win):
-    """Window-pixel masks of digit ink bboxes. cent [N,nd,2], half [N,nd,2], cam [N,2] -> [N,nd,win,win] bool."""
-    j = torch.arange(win, device=cent.device).float()
-    wx = cam[:, None, 0, None] + j                                          # [N,1,win] world x of window cols
-    wy = cam[:, None, 1, None] + j
-    dx = torch.remainder(wx - cent[..., 0, None] + world / 2, world) - world / 2   # [N,nd,win]
-    dy = torch.remainder(wy - cent[..., 1, None] + world / 2, world) - world / 2
-    mx = dx.abs() <= half[..., 0, None] + 0.5
-    my = dy.abs() <= half[..., 1, None] + 0.5
-    return my[..., :, None] & mx[..., None, :]
-
-
 # ------------------------------------------------------------ rollouts ----
-def load_model(run, which, device, node_update=None, return_provenance=False):
+def load_model(run, which, device, node_update=None, return_provenance=False, dec_input=None, frozen_k=None):
     ck = torch.load(os.path.join(run, f"{which}.pt"), map_location=device, weights_only=False)
     args = dict(ck["args"])
     if node_update is not None:
@@ -78,19 +67,45 @@ def load_model(run, which, device, node_update=None, return_provenance=False):
     m = build_model(args).to(device)
     m.load_state_dict(ck["model"])
     m.eval()
+    configure_prediction(m, args, dec_input, frozen_k)
     result = (m, args, ck["step"])
     return result + (ck.get("provenance"),) if return_provenance else result
 
 
+def configure_prediction(model, saved_args, dec_input=None, frozen_k=None):
+    """Apply eval switches without rewriting checkpoint args; return the file suffix."""
+    saved_mode = saved_args.get("dec_input", "flowm")
+    saved_k = saved_args.get("frozen_k", 1)
+    mode = saved_mode if dec_input is None else dec_input
+    k = saved_k if frozen_k is None else frozen_k
+    if mode not in DEC_INPUTS:
+        raise ValueError(f"dec_input must be one of {DEC_INPUTS}")
+    if k < 0:
+        raise ValueError("frozen_k must be nonnegative")
+    model.dec_input, model.frozen_k = mode, k
+    suffix = f"_dec{mode}" if mode != saved_mode else ""
+    if mode == "frozen_prelift" and k != saved_k:
+        suffix += f"_fk{k}"
+    return suffix
+
+
+def prediction_metadata(model):
+    frozen = model.dec_input in FROZEN_INPUTS
+    return dict(dec_input=model.dec_input,
+                frozen_k=model.frozen_k if model.dec_input == "frozen_prelift" else None,
+                node_update_pred=False if frozen else model.node_update_pred,
+                node_update_pred_ignored=frozen)
+
+
 @torch.no_grad()
-def rollout(model, frames, an, cam0, T_obs, T_pred, dt, wall_band, amp, device, aux=False, vel0=None):
+def rollout(model, frames, an, cam0, T_obs, T_pred, dt, wall_band, amp, device, aux=False, vel0=None, digit_truth=None):
     """vel0 [B,nd,2]: true digit velocities, used only by --oracle_nodes models."""
     obs, ain, aout = frames[:, :T_obs], an[:, :T_obs], an[:, T_obs:T_obs + T_pred]
     wall0 = make_wall0(cam0, model.world, wall_band) if model.collision_kind == "bounce" else None
     nodes = oracle_nodes_from(vel0.to(frames.device)) if model.oracle else None
     with torch.autocast(device_type=device.split(":")[0], dtype=torch.bfloat16, enabled=amp):
-        out = model(obs, ain, aout, dt=dt, wall0=wall0, return_aux=aux, nodes=nodes)
-    if aux:
+        out = model(obs, ain, aout, dt=dt, wall0=wall0, return_aux=aux, nodes=nodes, digit_truth=digit_truth)
+    if aux or digit_truth is not None:
         return out[0].float(), {k: v.float() for k, v in out[1].items()}
     return out.float()
 
@@ -280,6 +295,10 @@ def main(argv=None):
                    help="adaptive: override whether nodes/imprints are updated during the prediction phase")
     p.add_argument("--node_update", default=None, choices=["lk", "lock"],
                    help="adaptive estimator override; default: checkpoint's saved value (lk for older checkpoints)")
+    p.add_argument("--dec_input", default=None, choices=DEC_INPUTS,
+                   help="prediction input override; default: checkpoint's saved mode")
+    p.add_argument("--frozen_k", type=int, default=None,
+                   help="frozen_prelift: zero-input tail length (saved value or 1); 0 freezes final pre-lift")
     # boost equivariance (on / off the velocity lattice)
     p.add_argument("--equiv_boost", action="store_true", help="boost equivariance of the memory (t=10,30) and of the predictions (t=10,20)")
     p.add_argument("--n_equiv", type=int, default=48)
@@ -299,6 +318,7 @@ def main(argv=None):
     if a.node_update_pred is not None:
         model.node_update_pred = a.node_update_pred == "on"
         args = dict(args, node_update_pred=a.node_update_pred)
+    pred_sfx = configure_prediction(model, args, a.dec_input, a.frozen_k)
     for k_, v_ in (("vmax_test", a.vmax_test), ("scene_boost", a.scene_boost), ("v_ring_lo", a.v_ring_lo)):
         if v_ is not None:
             args[k_] = v_
@@ -308,7 +328,7 @@ def main(argv=None):
     n_val = a.n_val or args.get("n_val", 1000)
     cfg = env_cfg_from_args(args, split="val")
     test_seed = VAL_SEED if a.test_seed is None else a.test_seed
-    sfx = (f"_seed{test_seed}_{a.ckpt}" if test_seed != VAL_SEED else "") + (f"_{a.tag}" if a.tag else "")
+    sfx = (f"_seed{test_seed}_{a.ckpt}" if test_seed != VAL_SEED else "") + (f"_{a.tag}" if a.tag else "") + pred_sfx
     W, win, band = cfg.world, cfg.window, args.get("wall_band", 3)
     cache = val_cache(cfg, n_val, T_obs=args.get("t_obs", VAL_T_OBS), device=device, seed=test_seed)
     T_obs, T_pred = args.get("t_obs", VAL_T_OBS), VAL_T_PRED
@@ -321,6 +341,7 @@ def main(argv=None):
                test_seed=test_seed, provenance=provenance, ckpt_provenance=ckpt_provenance, sets={},
                node_update=model.node_update, node_update_pred=getattr(model, "node_update_pred", None),
                readout_rel=getattr(model, "readout_rel", None))
+    res.update(prediction_metadata(model))
     role = "selection" if test_seed == VAL_SEED else "heldout"
     cache_set = dict(seed=test_seed, mnist_split="test", role=role, n=n_val, t_obs=T_obs, t_pred=T_pred, chunk=50)
 
@@ -368,6 +389,7 @@ def main(argv=None):
     res["sets"]["main"] = dict(cache_set, cache=val_cache_description(cache))
     mse_f, psnr_f, ssim_f = [], [], []       # [N, T_pred] each
     bounce_rows, ctrl_rows, vel_rows = [], [], []
+    concentration_rows = []
     sample = None
     for i in range(0, n_val, a.bs):
         sl = slice(i, i + a.bs)
@@ -375,7 +397,9 @@ def main(argv=None):
         an = cache["actions_noisy"][sl].to(device)
         cam = cache["cam"][sl].to(device)
         pred, aux = rollout(model, fr, an, cam[:, 0], T_obs, T_pred, 1.0, band, amp, device, aux=True,
-                            vel0=cache["vel"][sl, 0])
+                            vel0=cache["vel"][sl, 0],
+                            digit_truth=prediction_truth(cache, sl, T_obs, T_pred, device))
+        concentration_rows.append(aux["node_concentration"].cpu())
         pred = pred.clamp(0, 1)
         gt = fr[:, T_obs:T_obs + T_pred]
         N = len(fr)
@@ -435,6 +459,7 @@ def main(argv=None):
                 ok = cnt >= 5
                 vel_rows += [(key, e) for e in err[ok].tolist()]
 
+    res["node_concentration"] = concentration_summary(torch.cat(concentration_rows))
     mse_f, psnr_f, ssim_f = torch.cat(mse_f), torch.cat(psnr_f), torch.cat(ssim_f)
     for H in (20, 150):
         res[f"mse{H}"], res[f"mse{H}_ci"] = ci95(mse_f[:, :H].mean(1).numpy())

@@ -79,6 +79,13 @@ from a digit's velocity in the median.*
 `--model adaptive --node_update lock` enables lock-then-refine velocity updates;
 the default is `lk`. See [the method and evidence](docs/PR1_lock_nodes.md).
 
+`kwm.eval --dec_input {flowm,zero,frozen,frozen_prelift}` overrides prediction
+inputs; omitting it preserves the checkpoint's policy and output basenames.
+`--frozen_k K` controls the pre-lift variant's zero-input tail (default 1;
+K=0 freezes the exact final pre-lift tensor). `kwm.train --dec_input` accepts
+`flowm|zero|frozen_prelift`. See [prediction policies](docs/PR3_pred_input.md)
+and the [pilot gate](docs/GATE_pred_input.md) before using a frozen policy.
+
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt

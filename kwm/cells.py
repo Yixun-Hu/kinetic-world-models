@@ -59,6 +59,13 @@ class _Base(nn.Module):
         B, V, C, H, W = hs.shape
         return self.conv_h(hs.reshape(B * V, C, H, W)).reshape(B, V, C, H, W)
 
+    def feature_update(self, u_t, hs, return_prelift=False):
+        # Preserve the original lift -> mix -> add -> activation arithmetic.
+        lifted = self.lift(u_t, self.num_v)
+        prelift = self.mix(hs)
+        out = self.act(lifted + prelift)
+        return (out, prelift) if return_prelift else out
+
 
 class FloWMCell(_Base):
     def __init__(self, in_ch=1, C=64, world=50, window=32, v_range=2):
@@ -68,13 +75,13 @@ class FloWMCell(_Base):
         self.num_v = len(self.v_list)
         self.register_buffer("nodes", torch.tensor(self.v_list).float(), persistent=False)
 
-    def forward(self, u_t, h_prev, action, dt=1.0):
+    def forward(self, u_t, h_prev, action, dt=1.0, *, return_prelift=False):
         if dt != 1.0:
             raise ValueError("FloWM (integer roll) cannot stream a fractional time step")
         hs = torch.stack([torch.roll(hv, shifts=(vy, vx), dims=(2, 3))
                           for hv, (vx, vy) in zip(h_prev.unbind(1), self.v_list)], 1)   # intrinsic flow
         hs = int_roll_batch(hs, -action)                                    # ego motion (integerised)
-        return self.act(self.lift(u_t, self.num_v) + self.mix(hs))
+        return self.feature_update(u_t, hs, return_prelift)
 
 
 class KineticCell(_Base):
@@ -84,12 +91,13 @@ class KineticCell(_Base):
         super().__init__(in_ch, C, world, window)
         self.num_v = num_v
 
-    def forward(self, u_t, h_prev, action, nodes, dt=1.0, collision=None, *, update_nodes=None):
+    def forward(self, u_t, h_prev, action, nodes, dt=1.0, collision=None, *, update_nodes=None,
+                return_prelift=False):
         # Common kinetic-cell interface; this cell's nodes are always fixed.
         if collision is not None:
             h_prev = collision(h_prev)
         hs = stream(h_prev, nodes, action, dt)                               # spectral, exact
-        return self.act(self.lift(u_t, self.num_v) + self.mix(hs))
+        return self.feature_update(u_t, hs, return_prelift)
 
 
 class AdaptiveNodeCell(_Base):
@@ -187,10 +195,11 @@ class AdaptiveNodeCell(_Base):
         fields = st[..., None, None].expand(B, V, E, H, W).to(h.dtype)
         return torch.cat([content[:, :, :C], fields, content[:, :, C:]], 2)
 
-    def forward(self, u_t, h_prev, action, nodes, dt=1.0, collision=None, update_nodes=None):
+    def forward(self, u_t, h_prev, action, nodes, dt=1.0, collision=None, update_nodes=None,
+                return_prelift=False):
         update_nodes = self.update_nodes if update_nodes is None else update_nodes
         if self.node_update == "lock":
-            return self._forward_lock(u_t, h_prev, action, nodes, dt, collision, update_nodes)
+            return self._forward_lock(u_t, h_prev, action, nodes, dt, collision, update_nodes, return_prelift)
         C, K, E = self.C, self.K_imp, self.extra
         if collision is not None:                       # wall bounce on the adaptive nodes
             h_prev = collision(h_prev)
@@ -220,16 +229,18 @@ class AdaptiveNodeCell(_Base):
         step = (self.n_s * gain * delta / dt).clamp(-self.step_clip, self.step_clip)
         rho_new = (rho + step).clamp(-self.bound, self.bound)
         self.last_nodes = (nodes[None].float() + rho_new).detach()
-        h_new = self.act(self.lift(u_t, self.num_v) + self.mix(feat))
+        updated = self.feature_update(u_t, feat, return_prelift)
+        h_new = updated[0] if return_prelift else updated
         B, V, _, H, W = feat.shape
         fields = torch.cat([rho_new, W_new], 2)[..., None, None].expand(B, V, E, H, W)
         m_new = self.gamma * m.float()
         if update_nodes:                 # imprints are written only from real observations when frozen
             m_new = torch.cat([torch.cat([pu.float()[:, None].expand(B, V, K, win, win), m_new[:, :, :, :win, win:]], 4),
                                m_new[:, :, :, win:]], 3)
-        return torch.cat([h_new, fields.to(h_new.dtype), m_new.to(h_new.dtype)], 2)
+        state = torch.cat([h_new, fields.to(h_new.dtype), m_new.to(h_new.dtype)], 2)
+        return (state, updated[1]) if return_prelift else state
 
-    def _forward_lock(self, u_t, h_prev, action, nodes, dt, collision, update_nodes):
+    def _forward_lock(self, u_t, h_prev, action, nodes, dt, collision, update_nodes, return_prelift=False):
         if collision is not None:
             h_prev = collision(h_prev)
         rho = self.offsets(h_prev)
@@ -253,5 +264,7 @@ class AdaptiveNodeCell(_Base):
         else:
             state, pu = h_prev.nodes, h_prev.snapshot
         # Use the existing feature recurrence, independent of estimator state.
-        h_new = self.act(self.lift(u_t, self.num_v) + self.mix(feat))
-        return LockState(h_new, state, pu)
+        updated = self.feature_update(u_t, feat, return_prelift)
+        h_new = updated[0] if return_prelift else updated
+        out = LockState(h_new, state, pu)
+        return (out, updated[1]) if return_prelift else out

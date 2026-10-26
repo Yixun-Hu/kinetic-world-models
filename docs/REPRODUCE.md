@@ -153,3 +153,35 @@ Need the runs of Sections 1, 2 and 4 under `runs/` (`flowm_official_real_both`, 
 python scripts/qual_figs.py        # qual_rollout.png, mse_vs_horizon.png, qual_table.json
 python scripts/panorama_figs.py    # panorama*.png, velocity_space*.png, rollout*.gif, panorama_meta.json
 ```
+
+## PR3 prediction-input pilot gate
+
+Use the existing review selection cache and read-only pilot checkpoints. The
+script writes only to `results/pred_input_gate/` in this checkout. MSE@H means
+the mean over the **first H** predicted frames, with predictions clamped to
+[0,1]. It also records nearest-node concentration, checkpoint/cache hashes,
+per-sequence errors and CPU/wall time. See [the gate](GATE_pred_input.md).
+
+```bash
+CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=8 OPENBLAS_NUM_THREADS=1 \
+  /home/yixunhu/miniconda3/envs/flowm/bin/python scripts/pred_input_gate.py \
+  --runs /home/yixunhu/codespace/kinetic-world-models/runs \
+  --cache /home/yixunhu/codespace/kinetic-world-models/results/val_cache_w50_vel1_cam1_walls0_n32_T30+150.pt \
+  --n 16 --threads 8 --lock_ckpt ckpt_step10000 --lk_ckpt ckpt_step13000
+```
+
+The gate evaluated `last.pt`; these archives have identical model weights and
+pin the measured steps despite ongoing training. Omit the two checkpoint flags
+to evaluate the latest pilots instead. The reviewer's older outputs used steps
+9000/11000 and 32 sequences; this gate uses the permitted first-16 fallback.
+
+For general evaluation of one policy:
+
+```bash
+CUDA_VISIBLE_DEVICES="" python -m kwm.eval --run runs/pilot_lock --ckpt last \
+  --device cpu --dec_input frozen_prelift --frozen_k 0 --skip_tp
+```
+
+For differentiable pre-lift training, add `--dec_input frozen_prelift
+--frozen_k 1` to the training command. This is experimental; consult the gate
+before using it as a forecasting policy.
