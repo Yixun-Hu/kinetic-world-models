@@ -161,23 +161,26 @@ script writes only to `results/pred_input_gate/` in this checkout. MSE@H means
 the mean over the **first H** predicted frames, with predictions clamped to
 [0,1]. It also records nearest-node concentration, per-pixel effective node
 count, checkpoint/cache hashes, per-sequence errors and CPU/core time. Use
-`--variants` to reproduce the script-only de-ghosting, mix-once and
-zero-then-freeze experiments. See [the gate](GATE_pred_input.md).
+`--variants` to reproduce the script-only de-ghosting and mix-once experiments
+and the public `kwm.eval` zero-then-freeze sweep. See [the gate](GATE_pred_input.md).
 
 ```bash
 CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1 \
   /home/yixunhu/miniconda3/envs/flowm/bin/python scripts/pred_input_gate.py \
   --runs /home/yixunhu/codespace/kinetic-world-models/runs \
   --cache /home/yixunhu/codespace/kinetic-world-models/results/val_cache_w50_vel1_cam1_walls0_n32_T30+150.pt \
-  --n 16 --threads 4 --lock_ckpt ckpt_step10000 --lk_ckpt ckpt_step13000 --variants
+  --n 16 --threads 4 --lock_ckpt ckpt_step10000 --lk_ckpt ckpt_step13000 \
+  --variants --freeze_after 10 20 30
 ```
 
 The defaults pin those archives and 16 sequences. The default pre-lift sweep is
-K=0/4; use `--ks` only for an explicit additional sweep. The observation pass is
-shared across policies, each fixed anchor's FFT is cached, LK's carried
-velocity metadata is compacted for frozen decoding, the frozen and
-mix-once rows share transports, and the zero-then-freeze row reuses zero's first
-20 steps. Matching flowm/zero JSONs are reused from `--out` (or `--baseline-dir`)
+K=0/4; use `--ks` only for an explicit additional sweep. With `--variants`,
+`--freeze_after` defaults to 10/20/30 and accepts any subset of those cutoffs.
+The hybrid rows run the complete public evaluator rollout, including its
+observation pass and diagnostics. Other controls share an observation pass,
+cache fixed anchor FFTs and compact carried LK metadata for frozen decoding;
+the frozen and mix-once rows share transports.
+Matching flowm/zero JSONs are reused from `--out` (or `--baseline-dir`)
 after checking checkpoint/cache hashes, sample count, numerical-dependency
 source hashes, software versions and thread count; original baseline provenance
 is retained. Use `--refresh-baselines` to recompute. Older last.pt JSONs are refreshed
@@ -193,6 +196,15 @@ CUDA_VISIBLE_DEVICES="" python -m kwm.eval --run runs/pilot_lock --ckpt last \
   --device cpu --dec_input frozen_prelift --frozen_k 0 --skip_tp
 ```
 
-Frozen overrides are experimental negative controls that failed the pilot
-gate. Training accepts `--dec_input flowm|zero` only; `--frozen_k` is an
-evaluation sweep knob and defaults to 0.
+Pure frozen overrides are experimental negative controls that failed the pilot
+gate. To evaluate the hybrid through the standard GPU pipeline, for example:
+
+```bash
+python -m kwm.eval --run runs/pilot_lock --ckpt ckpt_step10000 --device cuda \
+  --dec_input zero_then_frozen --freeze_after 20 --test_seed 777
+```
+
+This writes `eval_seed777_ckpt_step10000_deczero_then_frozen20.json` and
+matching figures. `--freeze_after` defaults to 20 in `kwm.eval`; it counts
+prediction steps and supports any nonnegative integer. Training accepts
+`--dec_input flowm|zero` only; both cutoff knobs are evaluation-only.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CPU selection gate. Extra --variants are experiments, never kwm.eval modes."""
+"""CPU selection gate, including the kwm.eval zero_then_frozen cutoff sweep."""
 import argparse
 import hashlib
 import json
@@ -16,7 +16,7 @@ import torch
 
 from kwm.diagnostics import (concentration_at, digit_masks, effective_count_at,
                              effective_count_summary, prediction_truth)
-from kwm.eval import load_model
+from kwm.eval import configure_prediction, load_model, rollout
 from kwm.lock_nodes import LockState, features
 from kwm.provenance import source_hashes
 from kwm.transport import _phase
@@ -100,6 +100,16 @@ class Measurements:
             c = c[torch.isfinite(c)]
             self.concentration[str(t + 1)] = float(c.mean()) if c.numel() else None
 
+    def record_rollout(self, pred, aux):
+        """Use the public evaluator's predictions and diagnostics verbatim."""
+        self.mse = list((pred.clamp(0, 1) - self.target).square().mean((2, 3, 4)).unbind(1))
+        self.counts = list(aux["effective_node_count"].unbind(1))
+        for t in (1, 10, 20):
+            if t <= pred.shape[1]:
+                c = aux["node_concentration"][:, t - 1]
+                c = c[torch.isfinite(c)]
+                self.concentration[str(t)] = float(c.mean()) if c.numel() else None
+
     def result(self):
         mse = torch.stack(self.mse, 1)
         full_mse = mse
@@ -126,7 +136,7 @@ class Measurements:
 
 
 def recurrent(model, anchor, last_frame, actions, measurements, mode, steps):
-    h, prev, at20, first = anchor, last_frame, None, None
+    h, prev, first = anchor, last_frame, None
     for t in range(steps):
         frame = torch.zeros_like(prev) if mode == "zero" else prev
         h, _ = model.step(frame, h, actions[:, t], 1., None)
@@ -135,9 +145,14 @@ def recurrent(model, anchor, last_frame, actions, measurements, mode, steps):
         measurements.add(t, h, prev)
         if t == 0:
             first = prev
-        if t == 19:
-            at20 = h
-    return at20, first
+    return h, first
+
+
+def zero_then_frozen(model, saved_args, frames, actions, cam0, t_obs, freeze_after, truth):
+    """The gate hybrid uses exactly the standard kwm.eval override and rollout."""
+    configure_prediction(model, saved_args, "zero_then_frozen", freeze_after=freeze_after)
+    return rollout(model, frames, actions, cam0, t_obs, actions.shape[1] - t_obs,
+                   1., 3, False, str(frames.device), digit_truth=truth)
 
 
 def frozen(model, anchor, actions, measurements, activate=False, start=0, mix_measurements=None):
@@ -193,7 +208,9 @@ def main(argv=None):
     p.add_argument("--n", type=int, default=16, choices=(16, 32))
     p.add_argument("--threads", type=int, default=4, choices=range(1, 5))
     p.add_argument("--ks", type=int, nargs="+", default=[0, 4], help="explicit prelift sweep; default: 0 4")
-    p.add_argument("--variants", action="store_true", help="also run the reviewer's script-only experiments")
+    p.add_argument("--variants", action="store_true", help="also run de-ghosting/mix-once experiments and the eval hybrid sweep")
+    p.add_argument("--freeze_after", type=int, nargs="+", choices=(10, 20, 30), default=[10, 20, 30],
+                   help="zero_then_frozen cutoffs for --variants (default: 10 20 30)")
     p.add_argument("--out", type=Path, default=ROOT / "results/pred_input_gate")
     p.add_argument("--baseline-dir", type=Path, help="reuse matching flowm/zero JSONs (default: --out)")
     p.add_argument("--refresh-baselines", action="store_true")
@@ -248,10 +265,10 @@ def main(argv=None):
         def measurements():
             return Measurements(model, truth, fr[:, 30:180], count0)
 
-        def save(label, stats, start, mode=None, k=None, **extra):
-            row = dict(common, policy=label, dec_input=mode, frozen_k=k,
-                       node_update_pred=mode in ("flowm", "zero"),
-                       node_update_pred_ignored=mode not in ("flowm", "zero"),
+        def save(label, stats, start, mode=None, k=None, freeze_after=None, **extra):
+            row = dict(common, policy=label, dec_input=mode, frozen_k=k, freeze_after=freeze_after,
+                       node_update_pred=mode in ("flowm", "zero", "zero_then_frozen"),
+                       node_update_pred_ignored=mode not in ("flowm", "zero", "zero_then_frozen"),
                        experiment=mode is None, wall_seconds=time.perf_counter() - start[0],
                        cpu_seconds=time.process_time() - start[1], **stats, **extra)
             baselines = [r for r in rows if r["run"] == name and r["dec_input"] in ("flowm", "zero")]
@@ -264,18 +281,18 @@ def main(argv=None):
             return row
 
         clock = lambda: (time.perf_counter(), time.process_time())
-        zero_metrics, zero20, zero_first = None, None, None
+        zero_first = None
         for mode in ("flowm", "zero"):
             start = clock()
             cached = None if a.refresh_baselines else reusable_baseline(
                 (a.baseline_dir or a.out) / f"{name}_{mode}.json", common, mode)
             metrics = measurements()
             if cached is None:
-                at20, first = recurrent(model, hT, obs[:, -1], aout, metrics, mode, 150)
+                _, first = recurrent(model, hT, obs[:, -1], aout, metrics, mode, 150)
                 save(mode, metrics.result(), start, mode=mode, baseline_reused=False)
             else:
                 if mode == "zero" and a.variants:
-                    at20, first = recurrent(model, hT, obs[:, -1], aout, metrics, mode, 20)
+                    _, first = recurrent(model, hT, obs[:, -1], aout, metrics, mode, 20)
                     prefix = metrics.result()
                     assert prefix["mse20"] == cached["mse20"], "cached zero MSE@20 changed"
                     assert prefix["per_seq_mse20"] == cached["per_seq_mse20"], "cached zero sequence errors changed"
@@ -287,7 +304,7 @@ def main(argv=None):
                                           sha256=sha256((a.baseline_dir or a.out) / f"{name}_{mode}.json"),
                                           provenance=cached["provenance"]))
             if mode == "zero" and a.variants:
-                zero_metrics, zero20, zero_first = metrics.prefix(20), at20, first
+                zero_first = first
 
         start = clock()
         metrics, mix_metrics = measurements(), measurements() if a.variants else None
@@ -325,18 +342,20 @@ def main(argv=None):
                 start, metrics = clock(), measurements()
                 frozen(model, model.with_features(hT, feat), aout, metrics, activate=activate)
                 save(label, metrics.result(), start)
-            start = clock()
-            frozen(model, zero20, aout, zero_metrics, start=20)
-            save("zero20_then_frozen", zero_metrics.result(), start,
-                 prefix_source="zero: first 20 predictions and recurrent state reused",
-                 node_updates_first20=True)
+            for n in sorted(set(a.freeze_after)):
+                start, metrics = clock(), measurements()
+                pred, aux = zero_then_frozen(model, saved, fr, an[:, :180], cache["cam"][:a.n, 0], 30, n, truth)
+                metrics.record_rollout(pred, aux)
+                save(f"zero{n}_then_frozen", metrics.result(), start, mode="zero_then_frozen", freeze_after=n,
+                     implementation="kwm.eval.configure_prediction + kwm.eval.rollout")
 
     manifest = dict(provenance=provenance, script_sha256=script_hash, variants=a.variants,
-                    ks=a.ks, n=a.n, threads=a.threads, observations=observations,
+                    ks=a.ks, freeze_after=a.freeze_after if a.variants else [],
+                    n=a.n, threads=a.threads, observations=observations,
                     wall_seconds=time.perf_counter() - wall_start, cpu_seconds=time.process_time() - cpu_start,
                     baseline_reused=[r["run"] + ":" + r["policy"] for r in rows if r.get("baseline_reused")],
                     rows=[r["run"] + "_" + r["policy"] + ".json" for r in rows],
-                    timing_note="Use these process totals; frozen/mix_once share a timing group, and zero20 reuses the zero prefix.")
+                    timing_note="Use these process totals; frozen/mix_once share a timing group. Hybrids run the full public eval rollout.")
     (a.out / "runtime.json").write_text(json.dumps(manifest, indent=2, allow_nan=False) + "\n")
     print(f"TOTAL: {manifest['cpu_seconds']/60:.2f} CPU-core min; {manifest['wall_seconds']/60:.2f} wall min", flush=True)
 

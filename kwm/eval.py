@@ -24,7 +24,8 @@ import torch
 import torch.nn.functional as F
 
 from .env import EnvConfig, subsample
-from .model import build_model, count_params, make_wall0, oracle_nodes_from, DEC_INPUTS, FROZEN_INPUTS
+from .model import (build_model, count_params, make_wall0, oracle_nodes_from,
+                    DEC_INPUTS, FROZEN_INPUTS, EVAL_ONLY_INPUTS)
 from .diagnostics import digit_masks, prediction_truth, concentration_summary, effective_count_summary
 from .train import ROOT, VAL_SEED, VAL_T_OBS, VAL_T_PRED, val_cache, val_cache_description, env_cfg_from_args
 from .provenance import source_hashes, env_fingerprint
@@ -59,7 +60,8 @@ def ci95(a):
 
 
 # ------------------------------------------------------------ rollouts ----
-def load_model(run, which, device, node_update=None, return_provenance=False, dec_input=None, frozen_k=None):
+def load_model(run, which, device, node_update=None, return_provenance=False, dec_input=None, frozen_k=None,
+               freeze_after=None):
     ck = torch.load(os.path.join(run, f"{which}.pt"), map_location=device, weights_only=False)
     args = dict(ck["args"])
     if node_update is not None:
@@ -67,33 +69,40 @@ def load_model(run, which, device, node_update=None, return_provenance=False, de
     m = build_model(args).to(device)
     m.load_state_dict(ck["model"])
     m.eval()
-    configure_prediction(m, args, dec_input, frozen_k)
+    configure_prediction(m, args, dec_input, frozen_k, freeze_after)
     result = (m, args, ck["step"])
     return result + (ck.get("provenance"),) if return_provenance else result
 
 
-def configure_prediction(model, saved_args, dec_input=None, frozen_k=None):
+def configure_prediction(model, saved_args, dec_input=None, frozen_k=None, freeze_after=None):
     """Apply eval switches without rewriting checkpoint args; return the file suffix."""
     saved_mode = saved_args.get("dec_input", "flowm")
     mode = saved_mode if dec_input is None else dec_input
     # K is an explicit evaluation sweep knob, never inherited from checkpoint
     # training arguments (including transient pre-review PR3 checkpoints).
     k = 0 if frozen_k is None else frozen_k
+    n = 20 if freeze_after is None else freeze_after
     if mode not in DEC_INPUTS:
         raise ValueError(f"dec_input must be one of {DEC_INPUTS}")
     if k < 0:
         raise ValueError("frozen_k must be nonnegative")
-    model.dec_input, model.frozen_k = mode, k
+    if n < 0:
+        raise ValueError("freeze_after must be nonnegative")
+    model.dec_input, model.frozen_k, model.freeze_after = mode, k, n
     suffix = f"_dec{mode}" if mode != saved_mode else ""
+    if mode == "zero_then_frozen" and suffix:
+        suffix += str(n)
     if mode == "frozen_prelift" and k != 0:
         suffix += f"_fk{k}"
     return suffix
 
 
 def prediction_metadata(model):
-    frozen = model.dec_input in FROZEN_INPUTS
+    hybrid = model.dec_input == "zero_then_frozen"
+    frozen = model.dec_input in FROZEN_INPUTS or (hybrid and model.freeze_after == 0)
     return dict(dec_input=model.dec_input,
                 frozen_k=model.frozen_k if model.dec_input == "frozen_prelift" else None,
+                freeze_after=model.freeze_after if hybrid else None,
                 node_update_pred=False if frozen else model.node_update_pred,
                 node_update_pred_ignored=frozen)
 
@@ -300,6 +309,8 @@ def main(argv=None):
                    help="prediction input override; default: checkpoint's saved mode")
     p.add_argument("--frozen_k", type=int, default=None,
                    help="frozen_prelift sweep only (default 0): K>0 drops the last K observations and replays their actions with zeros")
+    p.add_argument("--freeze_after", type=int, default=20,
+                   help="zero_then_frozen only: run N zero-input prediction steps, then freeze (default 20; N>=0)")
     # boost equivariance (on / off the velocity lattice)
     p.add_argument("--equiv_boost", action="store_true", help="boost equivariance of the memory (t=10,30) and of the predictions (t=10,20)")
     p.add_argument("--n_equiv", type=int, default=48)
@@ -319,7 +330,7 @@ def main(argv=None):
     if a.node_update_pred is not None:
         model.node_update_pred = a.node_update_pred == "on"
         args = dict(args, node_update_pred=a.node_update_pred)
-    pred_sfx = configure_prediction(model, args, a.dec_input, a.frozen_k)
+    pred_sfx = configure_prediction(model, args, a.dec_input, a.frozen_k, a.freeze_after)
     for k_, v_ in (("vmax_test", a.vmax_test), ("scene_boost", a.scene_boost), ("v_ring_lo", a.v_ring_lo)):
         if v_ is not None:
             args[k_] = v_
@@ -540,7 +551,7 @@ def main(argv=None):
         tp = args.get("t_pred", 20)
         obs, ain, aout, tgt = fr[:, :T_obs], an[:, :T_obs], an[:, T_obs:T_obs + tp], fr[:, T_obs:T_obs + tp]
         tp_nodes = oracle_nodes_from(cache["vel"][:tpb, 0].to(device)) if model.oracle else None
-        frozen_eval = model.dec_input in FROZEN_INPUTS
+        frozen_eval = model.dec_input in EVAL_ONLY_INPUTS
         if not frozen_eval:
             model.train()
         sync = (lambda: torch.cuda.synchronize()) if device.startswith("cuda") else (lambda: None)

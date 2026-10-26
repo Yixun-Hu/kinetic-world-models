@@ -79,15 +79,19 @@ from a digit's velocity in the median.*
 `--model adaptive --node_update lock` enables lock-then-refine velocity updates;
 the default is `lk`. See [the method and evidence](docs/PR1_lock_nodes.md).
 
-`kwm.eval --dec_input {flowm,zero,frozen,frozen_prelift}` overrides prediction
+`kwm.eval --dec_input {flowm,zero,frozen,frozen_prelift,zero_then_frozen}` overrides prediction
 inputs; omitting it preserves the checkpoint's policy and output basenames.
+`--dec_input zero_then_frozen --freeze_after N` runs N zero-input prediction
+steps, then freezes the post-activation memory and transports it analytically;
+N defaults to 20. At that cutoff, this evaluation-only hybrid passes on one pilot
+checkpoint/rule combination and needs checkpoint-averaged held-out evaluation.
 The `frozen*` overrides are **experimental negative controls; failed the pilot
 gate**. `--frozen_k K` defaults to 0 (the exact final pre-lift tensor) and is
 only an explicit sweep knob: K>0 drops the last K observations and replays
 their camera actions with zeros. K=1 is effectively K=0 up to that dropped
 frame. `kwm.train --dec_input` accepts `flowm|zero` only. See
 [prediction policies and H3](docs/PR3_pred_input.md) and the
-[negative gate result and ghosting analysis](docs/GATE_pred_input.md).
+[pilot gate and ghosting analysis](docs/GATE_pred_input.md).
 
 ```bash
 python -m venv .venv && source .venv/bin/activate

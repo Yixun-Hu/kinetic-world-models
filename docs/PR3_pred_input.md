@@ -1,12 +1,14 @@
 # Prediction-phase input policies
 
-`kwm.eval --dec_input {flowm,zero,frozen,frozen_prelift}` overrides only the
+`kwm.eval --dec_input {flowm,zero,frozen,frozen_prelift,zero_then_frozen}` overrides only the
 prediction policy. Omitting it uses the checkpoint's saved policy, with `flowm`
 as the fallback for old checkpoints. The normal observation pass, parameter
 keys, default recurrence arithmetic, decoder and existing metric reductions
-are unchanged. Checkpoints contain only `flowm` or `zero`; frozen modes are
-evaluation-only negative controls that failed the pilot gate. Default forward
-values are tested against golden outputs from the actual pre-PR3 code at
+are unchanged. Checkpoints contain only `flowm` or `zero`; pure frozen modes are
+evaluation-only negative controls that failed the pilot gate. The hybrid
+`zero_then_frozen` is an evaluation-only candidate with one passing pilot
+checkpoint/rule combination at N=20; it needs checkpoint-averaged held-out
+evaluation. Default forward values are tested against golden outputs from the actual pre-PR3 code at
 `0c1198a`, including checkpoints saved by that code. Training gradients also
 have exact-equality regression coverage.
 
@@ -14,6 +16,7 @@ have exact-equality regression coverage.
 | --- | --- |
 | `flowm` | Feed the last observation, then each previous prediction, through the recurrent cell. |
 | `zero` | Feed zeros through the same recurrence; retain the configured prediction node-update policy. |
+| `zero_then_frozen` | Run zero-input recurrence for `--freeze_after N` prediction steps (default 20), then freeze the post-activation memory and its carried velocities and decode independent analytic transports. |
 | `frozen` | Freeze the final post-lift, post-activation feature memory and its velocity metadata; decode independent analytic transports. This is the negative control. |
 | `frozen_prelift`, K=0 | Freeze the last observation's transported-and-mixed recurrent content, before adding its lift and before activation. Activate after each analytic transport. |
 | `frozen_prelift`, K>0 | Take the state after observation T−K; replay the last K observation actions with zero inputs and node measurements disabled, then freeze. Activate after each analytic transport. |
@@ -50,6 +53,28 @@ the post-ReLU state. Call sites are FloWM line **84**, spectral line **100**,
 LK line **232**, and lock line **267**. In LK, `feat` is the transported
 feature-channel slice; in lock, it is the spectral transport of
 `h_prev.features` at line **249**. `frozen` anchors `h_T.features` instead.
+
+`zero_then_frozen` anchors `features(h_(T+N))[:, :, :C]`: the post-activation
+`out = self.act(lifted + prelift)` from `_Base.feature_update` in
+[cells.py](../kwm/cells.py#L62), returned by the Nth zero-input `step` in
+[`KineticWM._forward`](../kwm/model.py). This is exactly the former gate
+variant's anchor. It includes N learned mixing/activation steps and no new
+observation lifts. The complete state carries the velocities and estimator
+metadata at that cutoff. For prediction step `tau > N`,
+`KineticWM._predict_frozen` and `transport_frozen` shift that same anchor by
+
+```
+(lattice_i + carried_rho_i) * (tau - N) * dt - sum(actions_out[:, N:tau])
+```
+
+No additional cell activation is applied to the transported features. No cell
+steps, node updates, mixing or collisions occur after the freeze. During the first N prediction
+steps, `--node_update_pred on|off` has exactly the same effect as for `zero`.
+N counts prediction steps, including at fractional dt; it must be nonnegative.
+N=0 is bit-identical to `frozen`; N>=T_pred is bit-identical to `zero`.
+For N>0, JSON reports the configured `node_update_pred` and
+`node_update_pred_ignored: false`; that flag applies only before the cutoff.
+At N=0 it reports false/true, as for `frozen`.
 
 K=0 carries the final measured velocity metadata from `h_T`. K>0 carries
 metadata from `h_(T-K)` through the zero-input branch (LK's constant spatial
@@ -116,32 +141,38 @@ effective nodes out of 25, not the per-pixel statistic.
 Default evaluation computes both diagnostics on every main rollout. This adds
 diagnostic cost and JSON fields, but neither statistic changes predictions.
 
-JSON also records `dec_input` and the effective `frozen_k` (null for other
-modes). Append `_dec<mode>` to every evaluation output basename **only when the
+JSON also records `dec_input`, the effective `frozen_k` (null for other modes),
+and `freeze_after` (N for `zero_then_frozen`, null otherwise).
+Append `_dec<mode>` to every evaluation output basename **only when the
 mode differs from the saved checkpoint mode**. When a pre-lift K differs from
 the default K=0, also append `_fk<K>` to prevent sweeps
 from overwriting each other. Existing seed/tag suffixes precede these suffixes.
 For example, a saved `flowm` checkpoint evaluated with `--dec_input zero`
 writes `eval_deczero.json`; `--dec_input frozen_prelift` writes
 `eval_decfrozen_prelift.json`; adding `--frozen_k 4` writes
-`eval_decfrozen_prelift_fk4.json`. No override preserves existing basenames.
+`eval_decfrozen_prelift_fk4.json`. The hybrid suffix includes its cutoff:
+`--dec_input zero_then_frozen --freeze_after 20` writes
+`eval_deczero_then_frozen20.json` and corresponding PNGs. Omitting
+`--freeze_after` selects 20; it is never inherited from checkpoint arguments.
+No override preserves existing basenames.
 Legacy `frozen_k` training arguments are ignored: K>0 requires an explicit
 evaluation override.
 
 The requested new JSON fields and updated source provenance necessarily change
 JSON bytes. Existing numerical metrics, prediction arrays, default figure
 contents and filenames retain their default behavior. The training CLI has no
-frozen mode or `frozen_k` argument, so newly saved checkpoint arguments contain
-neither a frozen policy nor its sweep knob.
+frozen mode, `freeze_after`, or `frozen_k` argument, so newly saved checkpoint
+arguments contain neither a frozen policy nor its sweep knobs.
 
 ## Training and validation
 
-`kwm.train --dec_input` accepts **flowm|zero only**, as before PR3. Both frozen
-modes require evaluation overrides; training-mode frozen forwards are rejected.
+`kwm.train --dec_input` accepts **flowm|zero only**, as before PR3. All frozen
+and hybrid modes require evaluation overrides; their training-mode forwards
+are rejected.
 Evaluation throughput measures frozen inference and records a null training-step
 time with `training_skipped`; the normal flowm/zero benchmark is unchanged.
 Analytic transport is differentiable, but no frozen training support or training
-claim ships with this negative evaluation result.
+claim ships with these evaluation policies.
 
 The fast tests also cover original forward/backward bit equality, saved-mode
 and override equivalence, identity-mix first-step transport, removal of the
@@ -167,13 +198,27 @@ covered separately by PR1 tests.
 
 ## Pilot gate and limitations
 
-**NO-GO for frozen prediction.** Pure frozen, pre-lift and de-ghosted controls
+**NO-GO for pure frozen prediction.** Pure frozen, pre-lift and de-ghosted controls
 fail the joint MSE@20/@150 gate on both lock-10k and LK-13k, using the same
-first 16 selection-cache sequences. Zero-input recurrence for 20 steps followed
-by freezing is the sole exception on lock-10k; it fails on LK-13k and on the
+first 16 selection-cache sequences. At the default N=20, zero-input recurrence
+followed by freezing passes on lock-10k; it fails on LK-13k and on the
 reviewer's lock-9k/LK-11k checks (32 sequences). This is 1/4 checkpoint/rule
-combinations, not a robust prediction policy. The extra variants exist only
-inside `scripts/pred_input_gate.py --variants`.
+combinations, not a robust prediction policy. At N=20, the public eval mode
+reproduces **0.026780 / 0.036749 / 0.065977** (MSE@20/@50/@150) on lock-10k,
+versus zero **0.026780 / 0.042603 / 0.084857** and flowm
+**0.029367 / 0.044946 / 0.083409**. On LK-13k it gives
+**0.031235 / 0.048716 / 0.097513**, versus zero
+**0.031235 / 0.054237 / 0.095042**. It needs the checkpoint-averaged held-out
+evaluation before a robustness claim. `scripts/pred_input_gate.py --variants
+--freeze_after 10 20 30` now calls `kwm.eval.configure_prediction` and
+`kwm.eval.rollout` for this sweep; only the de-ghosting and mix-once controls
+remain script-internal experiments.
+
+The regenerated N=10 sweep passes on lock-10k and fails on LK-13k. N=30
+passes on both, with **0.026780 / 0.039092 / 0.062963** on lock and
+**0.031235 / 0.049556 / 0.090153** on LK. These additional selection-cache
+cutoffs do not change the N=20 default or replace checkpoint-averaged held-out
+evaluation; the one-of-four caveat above refers specifically to N=20.
 
 See [GATE_pred_input.md](GATE_pred_input.md) for the measured gate table,
 per-variant pass/fail decisions, exact protocol and runtime. The gate compares
@@ -215,6 +260,7 @@ endpoint; they are not the held-out H3 test.
 
 Three trained `--dec_input zero` seeds form a secondary arm, and are the first
 cut if the budget tightens. Pre-register: **if trained-zero is not better than
-evaluation-time-zero, report evaluation-time zero only.** Freeze-and-render,
-de-ghosting and zero-then-freeze are closed as negative results; no frozen
-training arm is proposed.
+evaluation-time-zero, report evaluation-time zero only.** Pure freeze-and-render
+and de-ghosting remain negative results. The zero-then-freeze hybrid is available
+for the checkpoint-averaged held-out evaluation; its pilot exception does not
+change H3's primary endpoint. No frozen training arm is proposed.

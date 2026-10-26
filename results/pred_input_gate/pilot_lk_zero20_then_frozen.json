@@ -14,7 +14,7 @@
   "checkpoint": "/home/yixunhu/codespace/kinetic-world-models/runs/pilot_lk/ckpt_step13000.pt",
   "checkpoint_sha256": "8404e718d1c9c7074e0a3e683189e9492e32f6c04c733d694df092799efa7a94",
   "provenance": {
-    "git_head": "d093e2e4c9684dc4889bbcace8b487efc33acbce",
+    "git_head": "0bfd81e69b73f14de5e4d714f095af27248e1d3d",
     "git_dirty": true,
     "files": {
       "kwm/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -23,9 +23,9 @@
       "kwm/diagnostics.py": "c36823ea4f29384afbfe59dc0dd2b354a9e973d4225660bcc979b83b0dad1ee7",
       "kwm/env.py": "ddbc473ab38b0d39d022603dfa5e7daf30d910a4f4512340663435883cb9a8c9",
       "kwm/equiv.py": "133046c90d845fcbd6dcd96578e4fc2f0e3c173c4da96dec6d3b1db8cdb456f2",
-      "kwm/eval.py": "60d50c0528c476327643e4ea02d5f3bd9ad3f0a3aedd681ebc40f4f5b6654aa9",
+      "kwm/eval.py": "633da593ecce6e1c30a99188ca78862a53c3ff3fa776423220e0711c9f52f78a",
       "kwm/lock_nodes.py": "c7f5d975faa0d945418205eb9d70eeba14e5f9dc339da5e6dd55f9145e9fb9f4",
-      "kwm/model.py": "065816ab48d3c47ee99f7c6f43ac22c9ac1d1bc2c852cabe2a89435e733f1245",
+      "kwm/model.py": "6e653360bfba74c0f69e167d26246b77bfd2e7e3fe154d79a410d32c30a58f87",
       "kwm/provenance.py": "7890656694d380c7ccf6e629635183ff11e543d04ea4ef280c562980cd180760",
       "kwm/train.py": "281e6dbaeed7a1245ae993b4a8748182a043aa7d1d35127e874bbaa7d42a14c7",
       "kwm/transport.py": "e5c151bcfe55f1b3a7bc059c879e62c49137f745a26df8a1232d0027a22167e8"
@@ -37,20 +37,21 @@
       "cuda_available": false
     }
   },
-  "script_sha256": "d98abd495e5fbe173ff69a0563687b868478b9e55f5b10116ea14a4ffa3ccdb8",
+  "script_sha256": "025a6eaf4867780403998b9ded6148d319f06759f3ede1201e8eaad82e12cf2e",
   "observation_statistics": {
     "effective_node_count": 22.071462631225586,
     "window_pooled_effective_nodes": 24.510345458984375,
     "largest_node_share": 0.06179887056350708
   },
   "policy": "zero20_then_frozen",
-  "dec_input": null,
+  "dec_input": "zero_then_frozen",
   "frozen_k": null,
-  "node_update_pred": false,
-  "node_update_pred_ignored": true,
-  "experiment": true,
-  "wall_seconds": 34.482445425353944,
-  "cpu_seconds": 124.98969729100008,
+  "freeze_after": 20,
+  "node_update_pred": true,
+  "node_update_pred_ignored": false,
+  "experiment": false,
+  "wall_seconds": 92.79635777091607,
+  "cpu_seconds": 340.59788711500005,
   "mse_curve": [
     0.013330817222595215,
     0.016383828595280647,
@@ -272,7 +273,6 @@
     0.1355656236410141,
     0.06890160590410233
   ],
-  "prefix_source": "zero: first 20 predictions and recurrent state reused",
-  "node_updates_first20": true,
+  "implementation": "kwm.eval.configure_prediction + kwm.eval.rollout",
   "gate_pass": false
 }

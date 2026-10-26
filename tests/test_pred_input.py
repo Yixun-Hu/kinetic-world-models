@@ -91,6 +91,7 @@ def test_pre_pr3_checkpoint_no_override_matches_base_golden(kind, rule, mode, tm
         (tmp_path / "last.pt").write_bytes(golden[key + "_checkpoint"].tobytes())
         model, saved, step = load_model(tmp_path, "last", "cpu")
         assert "frozen_k" not in saved and model.frozen_k == 0 and step == 17
+        assert "freeze_after" not in saved and model.freeze_after == 20
         assert configure_prediction(model, saved) == ""
         with torch.no_grad():
             actual, _ = rollout(model, torch.from_numpy(golden["frames"]),
@@ -110,6 +111,60 @@ def test_zero_override_matches_saved_zero(kind, rule, tmp_path):
     assert saved["dec_input"] == "flowm"
     with torch.no_grad():
         assert torch.equal(override(*inputs()), trained(*inputs()))
+
+
+@pytest.mark.parametrize("kind,rule", KINDS + [("oracle", "lk")])
+@pytest.mark.parametrize("n", [0, 3, 20])
+@pytest.mark.parametrize("update", [False, True])
+def test_zero_then_frozen_endpoints_are_bit_identical(kind, rule, n, update):
+    m = model_for(kind, rule, node_update_pred=update).eval()
+    nodes = torch.randn(1, m.num_v, 2) if kind == "oracle" else None
+    with torch.no_grad():
+        configure_prediction(m, {}, "frozen" if n == 0 else "zero")
+        expected = m(*inputs(), nodes=nodes)
+        configure_prediction(m, {}, "zero_then_frozen", freeze_after=n)
+        actual = m(*inputs(), nodes=nodes)
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("rule", ["lk", "lock"])
+@pytest.mark.parametrize("update", [False, True])
+def test_hybrid_freezes_post_activation_state_and_prediction_nodes(rule, update, monkeypatch):
+    m = model_for("adaptive", rule, node_update_pred=update, readout_rel=True).eval()
+    configure_prediction(m, {}, "zero_then_frozen", freeze_after=1)
+    obs, ain, aout = inputs()
+    steps, transports = [], []
+    step, transport = m.step, m.transport_frozen
+    def record_step(*args, **kwargs):
+        out = step(*args, **kwargs)
+        steps.append((out[0], m.cell.update_nodes))
+        return out
+    def record_transport(h, action, elapsed, activate=False):
+        transports.append((h, action.clone(), elapsed, activate))
+        return transport(h, action, elapsed, activate)
+    monkeypatch.setattr(m, "step", record_step)
+    monkeypatch.setattr(m, "transport_frozen", record_transport)
+    with torch.no_grad():
+        pred, aux = m(obs, ain, aout, dt=.5, record_nodes=True)
+        assert len(steps) == obs.shape[1] + 1
+        assert all(enabled for _, enabled in steps[:5])
+        anchor, enabled = steps[-1]
+        assert enabled == update
+        assert (features(anchor)[:, :, :m.C] >= 0).all()  # already activated
+        assert len(transports) == 2
+        cumulative = torch.zeros_like(aout[:, 0])
+        for i, (h, action, elapsed, activate) in enumerate(transports, 1):
+            cumulative = cumulative + aout[:, i]
+            assert h is anchor and not activate
+            assert elapsed == i * .5 and torch.equal(action, cumulative)
+            m._rel = aout[:, i] / .5
+            assert torch.equal(pred[:, i], m.decode(transport(anchor, cumulative, i * .5)))
+    assert m.cell.update_nodes is True  # restored for subsequent observations
+    nodes = aux["node_traj"]
+    torch.testing.assert_close(nodes[:, 6:], nodes[:, 5:6].expand(-1, 2, -1, -1), rtol=0, atol=5e-7)
+    assert torch.equal(nodes[:, 6], nodes[:, 7])
+    assert prediction_metadata(m)["node_update_pred"] == update
+    assert prediction_metadata(m)["node_update_pred_ignored"] is False
 
 
 def identity_mix(m):
@@ -247,7 +302,7 @@ def test_frozen_comoving_boost_predictions(kind, rule, mode, k, monkeypatch):
         assert (world_p - world_q).abs().max() < 1e-5
 
 
-@pytest.mark.parametrize("mode", ["frozen", "frozen_prelift"])
+@pytest.mark.parametrize("mode", ["frozen", "frozen_prelift", "zero_then_frozen"])
 def test_frozen_modes_are_eval_only(mode):
     with pytest.raises(SystemExit):
         parse_args(["--dec_input", mode])
@@ -264,6 +319,9 @@ def test_training_args_have_no_frozen_knob():
     assert not hasattr(parse_args([]), "frozen_k")
     with pytest.raises(SystemExit):
         parse_args(["--frozen_k", "0"])
+    assert not hasattr(parse_args([]), "freeze_after")
+    with pytest.raises(SystemExit):
+        parse_args(["--freeze_after", "20"])
 
 
 def test_effective_nodes_entropy_before_spatial_averaging():
@@ -329,9 +387,10 @@ def test_default_training_gradients_bit_identical(kind, rule):
         assert (p.grad is None and q.grad is None) or torch.equal(p.grad, q.grad)
 
 
-@pytest.mark.parametrize("mode", ["flowm", "zero", "frozen", "frozen_prelift"])
+@pytest.mark.parametrize("mode", ["flowm", "zero", "frozen", "frozen_prelift", "zero_then_frozen"])
 def test_eval_aux_concentration_all_modes(mode):
     m = model_for("spectral", "lk", dec_input=mode).eval()
+    m.freeze_after = 1
     obs, ain, aout = inputs()
     truth = dict(cent=torch.full((1, 3, 1, 2), 3.), half=torch.ones(1, 1, 2),
                  cam=torch.zeros(1, 3, 2), vel=torch.zeros(1, 3, 1, 2),
@@ -363,6 +422,16 @@ def test_filename_suffix(saved):
     m.frozen_k = 5
     with pytest.raises(ValueError, match="observation length"):
         m(*inputs())
+    assert configure_prediction(m, {"dec_input": saved, "freeze_after": 30}, "zero_then_frozen") == "_deczero_then_frozen20"
+    assert m.freeze_after == 20  # cutoff is never inherited from checkpoint args
+    for n in (0, 10, 20, 30):
+        assert configure_prediction(m, {"dec_input": saved}, "zero_then_frozen", freeze_after=n) == f"_deczero_then_frozen{n}"
+        assert prediction_metadata(m)["freeze_after"] == n
+        assert prediction_metadata(m)["node_update_pred_ignored"] == (n == 0)
+    with pytest.raises(ValueError, match="freeze_after must be nonnegative"):
+        configure_prediction(m, {}, "zero_then_frozen", freeze_after=-1)
+    assert configure_prediction(m, {"dec_input": saved}, freeze_after=10) == ""
+    assert prediction_metadata(m)["freeze_after"] is None
 
 
 def test_eval_cli_metadata_and_actual_filenames(tmp_path, monkeypatch, capsys):
@@ -401,4 +470,14 @@ def test_eval_cli_metadata_and_actual_filenames(tmp_path, monkeypatch, capsys):
     assert result["throughput"]["train_step_ms"] is None
     assert result["throughput"]["infer_ms_per_seq"] > 0
     assert result["throughput"]["training_skipped"] == "frozen modes are evaluation-only"
+    evaluate.main([f for f in flags if f != "--skip_tp"] +
+                  ["--dec_input", "zero_then_frozen", "--freeze_after", "2", "--node_update_pred", "off"])
+    suffix = "_deczero_then_frozen2"
+    assert {f"eval{suffix}.json", f"samples{suffix}.png", f"mse_curve{suffix}.png"} <= {p.name for p in out.iterdir()}
+    result = json.loads((out / f"eval{suffix}.json").read_text())
+    assert result["dec_input"] == "zero_then_frozen" and result["freeze_after"] == 2
+    assert result["frozen_k"] is None
+    assert result["node_update_pred_ignored"] is False and result["node_update_pred"] is False
+    assert result["throughput"]["train_step_ms"] is None
+    assert result["throughput"]["infer_ms_per_seq"] > 0
     capsys.readouterr()

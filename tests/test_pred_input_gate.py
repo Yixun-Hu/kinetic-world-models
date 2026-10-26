@@ -9,7 +9,7 @@ from kwm.eval import configure_prediction
 from kwm.lock_nodes import features
 from kwm.model import KineticWM
 from scripts.pred_input_gate import (FrozenTransport, Measurements, frozen, observation_pass,
-                                     recurrent, reusable_baseline)
+                                     recurrent, reusable_baseline, zero_then_frozen)
 
 
 @pytest.fixture(autouse=True)
@@ -70,6 +70,42 @@ def test_baseline_cache_rejects_different_checkpoint_or_sequences(tmp_path):
                        ("n", 32), ("threads", 1), ("provenance", dict(files={"kwm/model.py": "source-b"})),
                        ("provenance", dict(files=common["provenance"]["files"], software={"torch": "different"}))]:
         assert reusable_baseline(path, dict(common, **{key: value}), "zero") is None
+
+
+@pytest.mark.parametrize("rule", ["lk", "lock"])
+@pytest.mark.parametrize("update", [False, True])
+def test_gate_hybrid_matches_legacy_variant_and_eval(rule, update):
+    torch.manual_seed(812)
+    m = KineticWM("adaptive", C=2, world=12, window=8, imprint_k=2,
+                  node_update=rule, node_update_pred=update, readout_rel=True).eval()
+    frames = torch.rand(1, 8, 1, 8, 8)
+    actions = torch.randn(1, 8, 2)
+    truth = dict(cent=torch.full((1, 3, 1, 2), 3.), half=torch.ones(1, 1, 2),
+                 cam=torch.randn(1, 3, 2), vel=torch.randn(1, 3, 1, 2),
+                 visible=torch.ones(1, 3, 1, dtype=torch.bool))
+    with torch.no_grad():
+        h, _, _ = observation_pass(m, frames[:, :5], actions[:, :5], [])
+        old = Measurements(m, truth, frames[:, 5:], effective_count_at(m, h))
+        predictions = []
+        add = old.add
+        def record(t, state, pred):
+            predictions.append(pred)
+            add(t, state, pred)
+        old.add = record
+        m.cell.update_nodes = update
+        anchor, _ = recurrent(m, h, frames[:, 4], actions[:, 5:], old, "zero", 1)
+        frozen(m, anchor, actions[:, 5:], old, start=1)
+        m.cell.update_nodes = True
+        pred, aux = zero_then_frozen(m, {}, frames, actions, torch.zeros(1, 2), 5, 1, truth)
+        torch.testing.assert_close(pred, torch.stack(predictions, 1), rtol=0, atol=1e-6)
+        direct, direct_aux = m(frames[:, :5], actions[:, :5], actions[:, 5:], digit_truth=truth)
+        assert torch.equal(pred, direct)
+        assert all(torch.equal(aux[k], direct_aux[k]) for k in aux)
+        actual = Measurements(m, truth, frames[:, 5:], effective_count_at(m, h))
+        actual.record_rollout(pred, aux)
+        torch.testing.assert_close(torch.stack(actual.counts), torch.stack(old.counts), rtol=0, atol=1e-6)
+        torch.testing.assert_close(torch.stack(actual.mse), torch.stack(old.mse), rtol=0, atol=1e-6)
+        assert actual.concentration == pytest.approx(old.concentration, abs=1e-6)
 
 
 @pytest.mark.parametrize("threads", [1, 4])

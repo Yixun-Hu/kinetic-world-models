@@ -1,11 +1,17 @@
 # Prediction-input pilot gate
 
-**NO-GO for frozen prediction.** Every pure-frozen, pre-lift, de-ghosted and
-mix-once control fails the joint MSE@20/@150 gate. The sole exception is
-**zero-input for 20 steps, then freeze, on lock-10k**. That exception fails on
+**NO-GO for pure frozen prediction.** Every pure-frozen, pre-lift, de-ghosted and
+mix-once control fails the joint MSE@20/@150 gate. The N=20 hybrid exception is
+**zero-input for 20 steps, then freeze, on lock-10k**. That cutoff fails on
 LK-13k and on the reviewer’s lock-9k/LK-11k checks: **1/4 checkpoint/rule
-combinations**, not a robust prediction policy. Frozen overrides are retained
-as documented evaluation-only negative controls; training accepts flowm|zero.
+combinations**, not a robust prediction policy. `kwm.eval --dec_input
+zero_then_frozen --freeze_after N` now exposes the hybrid for standard
+evaluation (default N=20). It needs checkpoint-averaged held-out evaluation.
+Pure frozen overrides remain evaluation-only negative controls; training
+accepts flowm|zero only. The regenerated sweep below also evaluates N=10/30.
+N=10 passes on lock-10k only; **N=30 passes on both reproduced checkpoints**.
+These cutoff comparisons use the selection cache and do not establish
+checkpoint-averaged held-out performance. The default remains N=20.
 
 ## Protocol and checkpoint identity
 
@@ -25,8 +31,10 @@ The archives are pinned read-only inputs, independent of advancing last.pt files
 | pilot_lock/ckpt_step10000.pt | 10000 | `a78fb0bbeeae9f2d198c4610e8f8ec5ee3b893e95ac33dabf0aca7e6aaa0a0ab` |
 | pilot_lk/ckpt_step13000.pt | 13000 | `8404e718d1c9c7074e0a3e683189e9492e32f6c04c733d694df092799efa7a94` |
 
-Prediction node updates are enabled for flowm and zero. Frozen transport
-ignores that setting. The observation pass is shared across policies. K=0
+Prediction node updates are enabled for flowm and zero, including the hybrid's
+first N steps. None occur after freezing. The hybrid calls the full public
+`kwm.eval.rollout` path, including the observation pass. Other controls share
+an observation pass. K=0
 freezes the actual last pre-lift intermediate; K>0 **drops the last K
 observations**, then replays their actions with zero inputs and no node
 measurements. K=1 is effectively K=0 up to the dropped final frame and
@@ -52,17 +60,26 @@ or significance adjustment. MSE@50 is descriptive. Each cell below is
 | Oracle true-velocity node in digit boxes; WTA elsewhere | 0.056730 / 0.063243 / 0.082611 | 0.073464 / 0.084930 / 0.109949 | FAIL / FAIL |
 | Locked nodes only (flag > 0.5) | 0.075083 / 0.089555 / 0.111441 | — | FAIL / — |
 | Transport, then one mix + ReLU | 0.044932 / 0.071198 / 0.116984 | 0.047989 / 0.082491 / 0.141440 | FAIL / FAIL |
-| Zero-input for 20 steps, then frozen | 0.026780 / 0.036749 / 0.065977 | 0.031235 / 0.048716 / 0.097513 | **PASS** / FAIL |
+| zero_then_frozen N=10 | 0.026049 / 0.040830 / 0.079821 | 0.030740 / 0.056447 / 0.114830 | **PASS** / FAIL |
+| zero_then_frozen N=20 | 0.026780 / 0.036749 / 0.065977 | 0.031235 / 0.048716 / 0.097513 | **PASS** / FAIL |
+| zero_then_frozen N=30 | 0.026780 / 0.039092 / 0.062963 | 0.031235 / 0.049556 / 0.090153 | **PASS** / **PASS** |
 
-Rows after the pre-lift controls are **script-internal experiments**, reproduced
-by `scripts/pred_input_gate.py --variants`; they are not kwm.eval modes.
+De-ghosting and mix-once rows remain **script-internal experiments**. The
+`zero_then_frozen` rows use `kwm.eval.configure_prediction` and
+`kwm.eval.rollout`; there is no separate gate implementation of the hybrid.
+`scripts/pred_input_gate.py --variants --freeze_after 10 20 30` reproduces all
+these rows. The gate sweep defaults to those three cutoffs and accepts subsets.
 Winner-take-all retains the largest squared-energy node independently at every
 pixel. Oracle masking keeps the nearest true-velocity node in visible digit
 boxes at the final observation and uses WTA elsewhere; later digits win box
 overlaps, matching the reviewer. Locked-only retains a mean **4.75 nodes per
-sample** on lock (all nodes are retained if none is locked). The hybrid reuses
-the first 20 zero-input recurrent states/predictions and then transports its
-step-20 anchor without further recurrence. Its MSE@20 equals zero by construction.
+sample** on lock (all nodes are retained if none is locked). The hybrid freezes
+the Nth zero-input step's post-activation feature memory: the `out` of
+`_Base.feature_update` in [cells.py](../kwm/cells.py#L62), carried by
+`KineticWM._forward` in [model.py](../kwm/model.py). Its tail transports that
+anchor with the carried node velocities and the cumulative camera actions
+**since step N**, without more recurrence or activation. N>=20 has the same
+MSE@20 as zero by construction. [Exact time convention](PR3_pred_input.md#exact-anchor-and-time-convention).
 
 ## Short-horizon mismatch versus long-horizon ghosts
 
@@ -95,9 +112,11 @@ conflating checkpoints or subsets:
 | lock-9k | 0.0218 / 0.0343 / 0.0689 | 0.0218 / 0.0344 / 0.0720 | 0.0749 | FAIL |
 | LK-11k | 0.0284 / 0.0475 / 0.0833 | 0.0284 / 0.0484 / 0.0946 | 0.0924 | FAIL |
 
-The hybrid wins only at lock-10k, where zero’s long-horizon error has degraded.
-It does not justify a viable frozen prediction mode. Its lack of robustness
-closes the proposed hybrid alongside the pure-frozen and de-ghosting controls.
+At N=20 the hybrid wins only at lock-10k, where zero’s long-horizon error has
+degraded. Availability as an evaluation mode enables the checkpoint-averaged
+held-out check; it does not establish robustness or justify a frozen training
+arm. The N=10/30 sweep above is additional selection-set evidence, not an
+independent held-out test or a reason to retune the registered H3 endpoint.
 
 Across the four pilot checkpoint/rule combinations, **zero beats flowm at
 MSE@20 in 4/4, but at MSE@150 in only 3/4** (lock-10k is the exception).
@@ -127,7 +146,7 @@ prediction mean. τ=0 always means the ordinary final observation state:
 
 The reviewer’s 23–24.5 / 25 count pools energy over the window **before**
 entropy; it is a separate statistic, not the requested per-pixel mean. Both
-show broadly distributed energy. The original controls have:
+show broadly distributed energy. The controls and hybrid cutoffs have:
 
 | Checkpoint | Policy | Concentration τ=1 | τ=10 | τ=20 | Mean per-pixel effective nodes, τ=1…150 |
 | --- | --- | ---: | ---: | ---: | ---: |
@@ -136,11 +155,17 @@ show broadly distributed energy. The original controls have:
 | lock-10k | frozen | 0.1264 | 0.1522 | 0.1439 | 15.930 |
 | lock-10k | frozen_prelift K=0 (default) | 0.1592 | 0.1676 | 0.1602 | 16.098 |
 | lock-10k | frozen_prelift K=4 | 0.1841 | 0.1861 | 0.1752 | 16.334 |
+| lock-10k | zero_then_frozen N=10 | 0.1578 | 0.1920 | 0.1874 | 17.333 |
+| lock-10k | zero_then_frozen N=20 | 0.1578 | 0.1920 | 0.2016 | 17.440 |
+| lock-10k | zero_then_frozen N=30 | 0.1578 | 0.1920 | 0.2016 | 17.307 |
 | LK-13k | flowm | 0.0808 | 0.0830 | 0.0804 | 22.101 |
 | LK-13k | zero | 0.0953 | 0.0995 | 0.0924 | 18.770 |
 | LK-13k | frozen | 0.0846 | 0.1035 | 0.0961 | 19.008 |
 | LK-13k | frozen_prelift K=0 (default) | 0.0964 | 0.1047 | 0.0987 | 19.836 |
 | LK-13k | frozen_prelift K=4 | 0.1016 | 0.1030 | 0.1013 | 20.076 |
+| LK-13k | zero_then_frozen N=10 | 0.0953 | 0.0995 | 0.0948 | 21.053 |
+| LK-13k | zero_then_frozen N=20 | 0.0953 | 0.0995 | 0.0924 | 21.182 |
+| LK-13k | zero_then_frozen N=30 | 0.0953 | 0.0995 | 0.0924 | 21.148 |
 
 Default kwm.eval computes both diagnostics on every main rollout, adding cost
 and JSON fields. Labels never enter the normal dynamics. Only the explicitly
@@ -148,58 +173,42 @@ labelled script oracle uses truth to construct its mask.
 
 ## Runtime, validation and limitations
 
-**47.07 CPU-core minutes; 12.97 wall minutes** for the final
-four-thread `--variants` sweep. All four flowm/zero baseline rows were reused
-after matching pinned checkpoint/cache hashes, the first-16 subset, numerical
-source dependencies, software and thread count. Their original provenance is
-retained. Zero’s first 20 steps are rerun only to recover the hybrid anchor.
-One observation pass per checkpoint, cached anchor FFTs, compact carried LK
-metadata, shared frozen/mix-once transports, and omission of K=1/2 remove
-redundant work. Timings come from process totals in `runtime.json`; summing row
-times would double-count the frozen/mix-once group.
+The regenerated PR3 follow-up sweep took **105.39 CPU-core minutes /
+28.63 wall minutes**, with four torch threads and no CUDA.
+All 25 rows were regenerated on the same pinned checkpoints and first 16
+selection-cache sequences. No baseline rows were reused: the model source
+changed, so the cache identity checks required recomputation. The hybrid rows
+run full `kwm.eval.rollout` calls, including observations, recurrent prefixes,
+analytic tails and all standard diagnostics. Other controls still share an
+observation pass and cached anchor FFTs; frozen/mix-once share a timing group.
+Use process totals in `runtime.json`, not the sum of row timings.
 
-The default flowm/zero/frozen/K=0/K=4 controls account for **at most 25.74
-CPU-core minutes** of this run: subtract only the exclusively timed optional
-variants, conservatively leaving shared mix-once work, hybrid-prefix recovery
-and setup charged to the default controls. This is a measured component bound,
-not an additional standalone benchmark. The default gate is below the requested
-30–40 core-minute budget; the complete optional-variants sweep exceeds it.
-
-The one-time refresh and initial reproduction took **74.10 CPU-core minutes /
-20.27 wall minutes**, before the compact-LK optimization. This additional
-cost is reported in `runtime_refresh.json`, not hidden in the recurring-gate
-figure. The previous JSONs used last.pt serialization hashes and lacked the
-new entropy diagnostic, so the four baselines were recomputed once. Combined
-gate execution for this revision was **121.17 CPU-core minutes /
-33.24 wall minutes**. Thus the recurring sweep is trimmed;
-bootstrapping the refreshed baseline artifacts costs extra.
-
-One earlier cache-validation attempt stopped on a reduction-order assertion
-after approximately **43.5 seconds wall time** (from log timestamps; CPU time
-was not captured). That failed attempt is additional to the completed-run
-totals above. A standalone 20-frame reduction rounded differently from the
-same prefix in a 150-frame tensor. The script now preserves the full-horizon
-layout and checks exact scalar, per-sequence and framewise prefix equality;
-regression tests cover one and four threads. Gate comparisons use no tolerance.
+The full and focused test suites ran during part of this sweep; wall time includes that
+contention, while the recorded process CPU time excludes the test process.
+`runtime_refresh.json` is retained as a historical artifact from the preceding
+PR3 revision, not part of this run.
 
 Validation used the specified flowm Python, `CUDA_VISIBLE_DEVICES=""`, and at
-most four torch threads. `python -m pytest -q`: **237 passed, 2 existing slow
-tests skipped in 52.49 s**. `tests/test_pred_input.py`: **75 passed in 6.42 s**
-(under 30 s). Both runs reported only the existing dependency deprecation
-warning. Eight golden cases load checkpoints saved by the actual pre-PR3 code
-and match its eval outputs with `torch.equal`; optimized gate transports,
-carried velocities and decoding also have exact-equality regression tests.
+most four torch threads. `python -m pytest -q`: **277 passed, 2 skipped, 1 warning in 54.38s**.
+`tests/test_pred_input.py`: **111 passed, 1 warning in 9.72s** (under 30 s).
+The only warning is the existing dependency deprecation warning. Tests cover
+bit-identical endpoints (N=0 versus frozen, N>=T_pred versus zero), both node
+update settings, the exact post-activation anchor and fractional-time camera
+sum, gate/legacy/eval agreement within 1e-6, suffixes, JSON metadata, inference
+throughput and rejection of training support. Eight pre-PR3 checkpoint golden
+cases still match with `torch.equal`. N=20/30 gate prefixes also match zero's
+scalar, per-sequence and framewise MSE@20 exactly. GPU execution was not run;
+the mode uses the standard device-aware evaluator and transport operations.
 
 These are selection-cache diagnostics, not held-out multi-seed evidence.
 The decoders were trained on recurrent prediction states with teacher forcing
-0.125; evaluation-only frozen states create a training/distribution mismatch.
-The NO-GO does not establish the outcome of separately training a frozen model,
-which is outside the plan. Ballistic periodic transport also omits future
-collisions, velocity changes and new observations.
+0.125. The hybrid needs checkpoint-averaged held-out evaluation; the pilot
+does not establish the outcome of separately training a frozen model, which
+is outside the plan. Ballistic periodic transport omits future collisions,
+velocity changes and new observations after the freeze.
 
 No dependency, pilot checkpoint or external cache was modified. The referenced
-PLAN_v4_KWM.md and its amendment were absent from this worktree, so their H3
-correction is recorded in PR3_pred_input.md. K=1/2 result files were removed
-from the default sweep. [Reproduction command](REPRODUCE.md#pr3-prediction-input-pilot-gate);
+PLAN_v4_KWM.md and its amendment are absent from this worktree; the H3 correction
+is recorded in PR3_pred_input.md. [Reproduction command](REPRODUCE.md#pr3-prediction-input-pilot-gate);
 [raw results](../results/pred_input_gate) include per-sequence prefix errors,
 framewise MSE, diagnostics, identities, provenance, gate decisions and timing.

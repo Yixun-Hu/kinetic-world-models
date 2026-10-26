@@ -44,9 +44,10 @@ from .transport import spectral_shift, stream
 
 MODELS = ("flowm", "spectral", "adaptive", "oracle")
 COLLISIONS = ("none", "bounce", "vmix", "mlp")
-DEC_INPUTS = ("flowm", "zero", "frozen", "frozen_prelift")
+DEC_INPUTS = ("flowm", "zero", "frozen", "frozen_prelift", "zero_then_frozen")
 TRAIN_DEC_INPUTS = ("flowm", "zero")
 FROZEN_INPUTS = ("frozen", "frozen_prelift")
+EVAL_ONLY_INPUTS = FROZEN_INPUTS + ("zero_then_frozen",)
 
 
 def make_wall0(cam0, world, band=3):
@@ -75,6 +76,7 @@ class KineticWM(nn.Module):
         if frozen_k < 0:
             raise ValueError("frozen_k must be nonnegative")
         self.frozen_k = frozen_k
+        self.freeze_after = 20                    # evaluation-only zero-then-frozen cutoff
         self.node_update_pred = node_update_pred   # adaptive: keep updating nodes / imprints on the model's own predictions
         self.node_update = node_update
         self.readout_rel = readout_rel             # moment readout uses velocities relative to the observer
@@ -259,7 +261,7 @@ class KineticWM(nn.Module):
             feat = self.cell.act(feat)
         return self.with_features(h, feat)
 
-    def _predict_frozen(self, anchor, actions_out, dt, aux, digit_truth):
+    def _predict_frozen(self, anchor, actions_out, dt, aux, digit_truth, start=0):
         """Evaluation-only independent transports from one fixed anchor."""
         cumulative_action = actions_out.new_zeros(actions_out.shape[0], 2)
         outs = []
@@ -271,7 +273,7 @@ class KineticWM(nn.Module):
                 self._node_traj.append(self.node_velocity(h)[..., 0, 0].detach())
             self._rel = actions_out[:, t] / dt if self.readout_rel else None
             outs.append(self.decode(h, aux))
-            self._record_diagnostics(aux, h, digit_truth, t)
+            self._record_diagnostics(aux, h, digit_truth, start + t)
         return torch.stack(outs, 1)
 
     def _record_diagnostics(self, aux, h, digit_truth, t):
@@ -286,7 +288,7 @@ class KineticWM(nn.Module):
         return_states: iterable of observation-step indices t; the full memory after processing frame t
         is returned in aux["states"][t] (equivariance tests). Implies return_aux.
         record_nodes (adaptive): aux["node_traj"] [B,T,V,2] = nu_i(t+1) after every step."""
-        if self.training and self.dec_input in FROZEN_INPUTS:
+        if self.training and self.dec_input in EVAL_ONLY_INPUTS:
             raise ValueError("frozen prediction modes are evaluation-only; call eval() and use an eval override")
         if self.oracle and nodes is None:
             raise ValueError("the oracle model needs nodes=[B,V,2] (see oracle_nodes_from)")
@@ -309,7 +311,8 @@ class KineticWM(nn.Module):
                  digit_truth=None):
         B, T_in = obs.shape[:2]
         T_pred = actions_out.shape[1]
-        frozen = self.dec_input in FROZEN_INPUTS
+        zero_then_frozen = self.dec_input == "zero_then_frozen"
+        frozen = self.dec_input in FROZEN_INPUTS or (zero_then_frozen and self.freeze_after == 0)
         prelift_mode = self.dec_input == "frozen_prelift"
         if prelift_mode and self.frozen_k >= T_in:
             raise ValueError("frozen_k must be smaller than the observation length")
@@ -362,10 +365,11 @@ class KineticWM(nn.Module):
         if self.kind == "adaptive" and not self.node_update_pred:
             self.cell.update_nodes = False
         outs = []
-        for t in range(T_pred):
+        recurrent_steps = min(self.freeze_after, T_pred) if zero_then_frozen else T_pred
+        for t in range(recurrent_steps):
             if self.training and target is not None and random.random() < tf_ratio:
                 frame = target[:, t]
-            elif self.dec_input == "zero":
+            elif self.dec_input == "zero" or zero_then_frozen:
                 frame = torch.zeros_like(prev)
             else:
                 frame = prev
@@ -376,6 +380,14 @@ class KineticWM(nn.Module):
             outs.append(out)
             prev = out
         preds = torch.stack(outs, 1)
+        if zero_then_frozen and recurrent_steps < T_pred:
+            # Freeze h after the Nth zero-input step: its feature channels are
+            # cells._Base.feature_update's `out = self.act(lifted + prelift)`.
+            # Carry that post-activation tensor and velocity metadata unchanged;
+            # each tail frame uses elapsed time/actions since this anchor only.
+            tail = self._predict_frozen(h, actions_out[:, recurrent_steps:], dt, aux, digit_truth,
+                                        start=recurrent_steps)
+            preds = torch.cat([preds, tail], 1)
         return self._prediction_result(preds, aux, states, keep)
 
     @staticmethod
