@@ -7,27 +7,27 @@
   "role": "selection",
   "seed": 12345,
   "device": "cpu",
-  "threads": 8,
+  "threads": 4,
   "batch_size": 16,
   "cache": "/home/yixunhu/codespace/kinetic-world-models/results/val_cache_w50_vel1_cam1_walls0_n32_T30+150.pt",
   "cache_sha256": "1d3f58ce06e2c743f9d26135e47fa8d4aa66da98f08baa27f8764597bcf266f4",
-  "checkpoint": "/home/yixunhu/codespace/kinetic-world-models/runs/pilot_lock/last.pt",
-  "checkpoint_sha256": "26b4bf40ed4e27c6e2e08cef35b3ba48907b60abd2d473bd29c89c0d89bccf81",
+  "checkpoint": "/home/yixunhu/codespace/kinetic-world-models/runs/pilot_lock/ckpt_step10000.pt",
+  "checkpoint_sha256": "a78fb0bbeeae9f2d198c4610e8f8ec5ee3b893e95ac33dabf0aca7e6aaa0a0ab",
   "provenance": {
-    "git_head": "0c1198a048b4c0d7db310552efa2112bc4dfd9db",
+    "git_head": "d093e2e4c9684dc4889bbcace8b487efc33acbce",
     "git_dirty": true,
     "files": {
       "kwm/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "kwm/cells.py": "61da655b6e006626263ade2e737e218c4db7f9ff886b23e7fe318a362a3d17e9",
       "kwm/collision.py": "c2fb51062378200ad7b4e1a757009c7c6f0742fe0148ebe31072064168cdd87e",
-      "kwm/diagnostics.py": "5197f2af44a4fb8dd63a299cd0b8d52a8ae05ad214c8db4a1b0ac55fb5be010c",
+      "kwm/diagnostics.py": "c36823ea4f29384afbfe59dc0dd2b354a9e973d4225660bcc979b83b0dad1ee7",
       "kwm/env.py": "ddbc473ab38b0d39d022603dfa5e7daf30d910a4f4512340663435883cb9a8c9",
       "kwm/equiv.py": "133046c90d845fcbd6dcd96578e4fc2f0e3c173c4da96dec6d3b1db8cdb456f2",
-      "kwm/eval.py": "fc4fc12f0f254d513a8be4cfafd644b50552c591da7a76105b1fd7c38d8a3845",
+      "kwm/eval.py": "60d50c0528c476327643e4ea02d5f3bd9ad3f0a3aedd681ebc40f4f5b6654aa9",
       "kwm/lock_nodes.py": "c7f5d975faa0d945418205eb9d70eeba14e5f9dc339da5e6dd55f9145e9fb9f4",
-      "kwm/model.py": "a8f271f30cf9e6b21133efc691aef236ecad475c2525d7782f2e6db21bc11db4",
+      "kwm/model.py": "065816ab48d3c47ee99f7c6f43ac22c9ac1d1bc2c852cabe2a89435e733f1245",
       "kwm/provenance.py": "7890656694d380c7ccf6e629635183ff11e543d04ea4ef280c562980cd180760",
-      "kwm/train.py": "e57a3e1f2fdad3d592e8299b48bec613c9c663559937b418dac8c688ea6b6f89",
+      "kwm/train.py": "281e6dbaeed7a1245ae993b4a8748182a043aa7d1d35127e874bbaa7d42a14c7",
       "kwm/transport.py": "e5c151bcfe55f1b3a7bc059c879e62c49137f745a26df8a1232d0027a22167e8"
     },
     "software": {
@@ -37,17 +37,21 @@
       "cuda_available": false
     }
   },
+  "script_sha256": "d98abd495e5fbe173ff69a0563687b868478b9e55f5b10116ea14a4ffa3ccdb8",
+  "observation_statistics": {
+    "effective_node_count": 19.66696548461914,
+    "window_pooled_effective_nodes": 23.036197662353516,
+    "largest_node_share": 0.08632832765579224,
+    "locked_nodes_per_sample": 4.75
+  },
+  "policy": "frozen_prelift_k0",
   "dec_input": "frozen_prelift",
   "frozen_k": 0,
   "node_update_pred": false,
   "node_update_pred_ignored": true,
-  "wall_seconds": 68.86034751823172,
-  "cpu_seconds": 495.2552629500001,
-  "node_concentration": {
-    "1": 0.15923969447612762,
-    "10": 0.1676110327243805,
-    "20": 0.1602308601140976
-  },
+  "experiment": false,
+  "wall_seconds": 43.622620237991214,
+  "cpu_seconds": 158.157710033,
   "mse_curve": [
     0.018168888986110687,
     0.02113586850464344,
@@ -200,6 +204,18 @@
     0.17316842079162598,
     0.17123904824256897
   ],
+  "node_concentration": {
+    "1": 0.15923969447612762,
+    "10": 0.1676110327243805,
+    "20": 0.1602308601140976
+  },
+  "effective_node_count": {
+    "0": 19.66696548461914,
+    "1": 17.031526565551758,
+    "10": 16.623889923095703,
+    "20": 16.433467864990234,
+    "mean_prediction": 16.0975341796875
+  },
   "mse20": 0.04842609912157059,
   "per_seq_mse20": [
     0.06623231619596481,

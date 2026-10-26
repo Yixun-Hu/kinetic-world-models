@@ -25,7 +25,7 @@ import torch.nn.functional as F
 
 from .env import EnvConfig, subsample
 from .model import build_model, count_params, make_wall0, oracle_nodes_from, DEC_INPUTS, FROZEN_INPUTS
-from .diagnostics import digit_masks, prediction_truth, concentration_summary
+from .diagnostics import digit_masks, prediction_truth, concentration_summary, effective_count_summary
 from .train import ROOT, VAL_SEED, VAL_T_OBS, VAL_T_PRED, val_cache, val_cache_description, env_cfg_from_args
 from .provenance import source_hashes, env_fingerprint
 
@@ -75,16 +75,17 @@ def load_model(run, which, device, node_update=None, return_provenance=False, de
 def configure_prediction(model, saved_args, dec_input=None, frozen_k=None):
     """Apply eval switches without rewriting checkpoint args; return the file suffix."""
     saved_mode = saved_args.get("dec_input", "flowm")
-    saved_k = saved_args.get("frozen_k", 1)
     mode = saved_mode if dec_input is None else dec_input
-    k = saved_k if frozen_k is None else frozen_k
+    # K is an explicit evaluation sweep knob, never inherited from checkpoint
+    # training arguments (including transient pre-review PR3 checkpoints).
+    k = 0 if frozen_k is None else frozen_k
     if mode not in DEC_INPUTS:
         raise ValueError(f"dec_input must be one of {DEC_INPUTS}")
     if k < 0:
         raise ValueError("frozen_k must be nonnegative")
     model.dec_input, model.frozen_k = mode, k
     suffix = f"_dec{mode}" if mode != saved_mode else ""
-    if mode == "frozen_prelift" and k != saved_k:
+    if mode == "frozen_prelift" and k != 0:
         suffix += f"_fk{k}"
     return suffix
 
@@ -298,7 +299,7 @@ def main(argv=None):
     p.add_argument("--dec_input", default=None, choices=DEC_INPUTS,
                    help="prediction input override; default: checkpoint's saved mode")
     p.add_argument("--frozen_k", type=int, default=None,
-                   help="frozen_prelift: zero-input tail length (saved value or 1); 0 freezes final pre-lift")
+                   help="frozen_prelift sweep only (default 0): K>0 drops the last K observations and replays their actions with zeros")
     # boost equivariance (on / off the velocity lattice)
     p.add_argument("--equiv_boost", action="store_true", help="boost equivariance of the memory (t=10,30) and of the predictions (t=10,20)")
     p.add_argument("--n_equiv", type=int, default=48)
@@ -390,6 +391,7 @@ def main(argv=None):
     mse_f, psnr_f, ssim_f = [], [], []       # [N, T_pred] each
     bounce_rows, ctrl_rows, vel_rows = [], [], []
     concentration_rows = []
+    effective_count_rows = []
     sample = None
     for i in range(0, n_val, a.bs):
         sl = slice(i, i + a.bs)
@@ -400,6 +402,7 @@ def main(argv=None):
                             vel0=cache["vel"][sl, 0],
                             digit_truth=prediction_truth(cache, sl, T_obs, T_pred, device))
         concentration_rows.append(aux["node_concentration"].cpu())
+        effective_count_rows.append(aux["effective_node_count"].cpu())
         pred = pred.clamp(0, 1)
         gt = fr[:, T_obs:T_obs + T_pred]
         N = len(fr)
@@ -460,6 +463,7 @@ def main(argv=None):
                 vel_rows += [(key, e) for e in err[ok].tolist()]
 
     res["node_concentration"] = concentration_summary(torch.cat(concentration_rows))
+    res["effective_node_count"] = effective_count_summary(torch.cat(effective_count_rows))
     mse_f, psnr_f, ssim_f = torch.cat(mse_f), torch.cat(psnr_f), torch.cat(ssim_f)
     for H in (20, 150):
         res[f"mse{H}"], res[f"mse{H}_ci"] = ci95(mse_f[:, :H].mean(1).numpy())
@@ -536,12 +540,14 @@ def main(argv=None):
         tp = args.get("t_pred", 20)
         obs, ain, aout, tgt = fr[:, :T_obs], an[:, :T_obs], an[:, T_obs:T_obs + tp], fr[:, T_obs:T_obs + tp]
         tp_nodes = oracle_nodes_from(cache["vel"][:tpb, 0].to(device)) if model.oracle else None
-        model.train()
+        frozen_eval = model.dec_input in FROZEN_INPUTS
+        if not frozen_eval:
+            model.train()
         sync = (lambda: torch.cuda.synchronize()) if device.startswith("cuda") else (lambda: None)
         if device.startswith("cuda"):
             torch.cuda.reset_peak_memory_stats()
         ts = []
-        for r in range(3):
+        for r in range(0 if frozen_eval else 3):
             sync(); t0 = time.time()
             with torch.autocast(device_type=device.split(":")[0], dtype=torch.bfloat16, enabled=amp):
                 pr = model(obs, ain, aout, target=tgt, tf_ratio=0.0, wall0=wall0, nodes=tp_nodes)
@@ -555,9 +561,11 @@ def main(argv=None):
             sync(); t0 = time.time()
             rollout(model, fr, an, cam0, T_obs, tp, 1.0, band, amp, device, vel0=cache["vel"][:tpb, 0])
             sync(); ti.append(time.time() - t0)
-        res["throughput"] = dict(bs=tpb, train_step_ms=1000 * float(np.median(ts[1:])),
+        res["throughput"] = dict(bs=tpb, train_step_ms=None if frozen_eval else 1000 * float(np.median(ts[1:])),
                                  peak_mem_mb=mem, infer_ms_per_seq=1000 * float(np.median(ti[1:])) / tpb,
                                  grad_ckpt=bool(model.grad_ckpt), amp=amp, device=device)
+        if frozen_eval:
+            res["throughput"]["training_skipped"] = "frozen modes are evaluation-only"
 
     with open(os.path.join(out_dir, f"eval{sfx}.json"), "w") as f:
         json.dump(res, f, indent=1)

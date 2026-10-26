@@ -37,6 +37,7 @@ import torch.utils.checkpoint as ckpt
 
 from .cells import FloWMCell, KineticCell, AdaptiveNodeCell
 from .lock_nodes import LockState, features
+from .diagnostics import concentration_at, effective_count_at
 from .collision import (lattice_nodes, reflection_perms, bounce_back, rigid_bounce_back,
                         known_wall_field, WallEncoder, VMixing, MLPCollision)
 from .transport import spectral_shift, stream
@@ -44,6 +45,7 @@ from .transport import spectral_shift, stream
 MODELS = ("flowm", "spectral", "adaptive", "oracle")
 COLLISIONS = ("none", "bounce", "vmix", "mlp")
 DEC_INPUTS = ("flowm", "zero", "frozen", "frozen_prelift")
+TRAIN_DEC_INPUTS = ("flowm", "zero")
 FROZEN_INPUTS = ("frozen", "frozen_prelift")
 
 
@@ -60,7 +62,7 @@ class KineticWM(nn.Module):
                  bounce="rigid", rigid_K=28, rigid_eps=1e-3, rigid_eps_rel=0.05,
                  dec_input="flowm", beta_init=10.0, grad_ckpt=False,
                  n_digits=5, imprint_k=8, imprint_gamma=0.9,
-                 node_update_pred=True, readout_rel=False, node_update="lk", frozen_k=1):
+                 node_update_pred=True, readout_rel=False, node_update="lk", frozen_k=0):
         super().__init__()
         if kind not in MODELS:
             raise ValueError(f"model must be one of {MODELS}")
@@ -68,8 +70,8 @@ class KineticWM(nn.Module):
             raise ValueError(f"collision must be one of {COLLISIONS}")
         self.kind, self.C, self.world, self.window = kind, C, world, window
         self.dec_input, self.grad_ckpt = dec_input, grad_ckpt
-        if dec_input not in DEC_INPUTS:
-            raise ValueError(f"dec_input must be one of {DEC_INPUTS}")
+        if dec_input not in TRAIN_DEC_INPUTS:
+            raise ValueError(f"checkpoint dec_input must be one of {TRAIN_DEC_INPUTS}; frozen modes are eval overrides")
         if frozen_k < 0:
             raise ValueError("frozen_k must be nonnegative")
         self.frozen_k = frozen_k
@@ -257,6 +259,26 @@ class KineticWM(nn.Module):
             feat = self.cell.act(feat)
         return self.with_features(h, feat)
 
+    def _predict_frozen(self, anchor, actions_out, dt, aux, digit_truth):
+        """Evaluation-only independent transports from one fixed anchor."""
+        cumulative_action = actions_out.new_zeros(actions_out.shape[0], 2)
+        outs = []
+        for t in range(actions_out.shape[1]):
+            cumulative_action = cumulative_action + actions_out[:, t]
+            h = self.transport_frozen(anchor, cumulative_action, (t + 1) * dt,
+                                      activate=self.dec_input == "frozen_prelift")
+            if self._node_traj is not None:
+                self._node_traj.append(self.node_velocity(h)[..., 0, 0].detach())
+            self._rel = actions_out[:, t] / dt if self.readout_rel else None
+            outs.append(self.decode(h, aux))
+            self._record_diagnostics(aux, h, digit_truth, t)
+        return torch.stack(outs, 1)
+
+    def _record_diagnostics(self, aux, h, digit_truth, t):
+        if digit_truth is not None:
+            aux["node_concentration"].append(concentration_at(self, h, digit_truth, t))
+            aux["effective_node_count"].append(effective_count_at(self, h))
+
     def forward(self, obs, actions_in, actions_out, target=None, tf_ratio=0.0, dt=1.0,
                 wall0=None, return_aux=False, nodes=None, return_states=None, record_nodes=False,
                 digit_truth=None):
@@ -264,6 +286,8 @@ class KineticWM(nn.Module):
         return_states: iterable of observation-step indices t; the full memory after processing frame t
         is returned in aux["states"][t] (equivariance tests). Implies return_aux.
         record_nodes (adaptive): aux["node_traj"] [B,T,V,2] = nu_i(t+1) after every step."""
+        if self.training and self.dec_input in FROZEN_INPUTS:
+            raise ValueError("frozen prediction modes are evaluation-only; call eval() and use an eval override")
         if self.oracle and nodes is None:
             raise ValueError("the oracle model needs nodes=[B,V,2] (see oracle_nodes_from)")
         self._nodes_ovr = nodes if self.oracle else None
@@ -285,7 +309,6 @@ class KineticWM(nn.Module):
                  digit_truth=None):
         B, T_in = obs.shape[:2]
         T_pred = actions_out.shape[1]
-        dev = obs.device
         frozen = self.dec_input in FROZEN_INPUTS
         prelift_mode = self.dec_input == "frozen_prelift"
         if prelift_mode and self.frozen_k >= T_in:
@@ -311,6 +334,12 @@ class KineticWM(nn.Module):
                 states[t] = (LockState(*(x.detach().float().clone() for x in h))
                              if isinstance(h, LockState) else h.detach().float().clone())
         prev = obs[:, -1]
+        return_aux = return_aux or bool(keep) or digit_truth is not None
+        aux = {"mean_velocity": [], "argmax_velocity": []} if return_aux else None
+        if digit_truth is not None:
+            aux["node_concentration"] = []
+            # tau=0 is the ordinary final observation state for every policy.
+            aux["effective_node_count"] = [effective_count_at(self, h)]
         if prelift_mode:
             if self.frozen_k == 0:
                 h = self.with_features(h, prelift)
@@ -327,38 +356,31 @@ class KineticWM(nn.Module):
                 finally:
                     self._node_traj = traj
                 h = anchor
-        anchor = h
-        cumulative_action = actions_out.new_zeros(B, 2) if frozen else None
+        if frozen:
+            preds = self._predict_frozen(h, actions_out, dt, aux, digit_truth)
+            return self._prediction_result(preds, aux, states, keep)
         if self.kind == "adaptive" and not self.node_update_pred:
             self.cell.update_nodes = False
-        return_aux = return_aux or bool(keep) or digit_truth is not None
-        aux = {"mean_velocity": [], "argmax_velocity": []} if return_aux else None
-        if digit_truth is not None:
-            aux["node_concentration"] = []
         outs = []
         for t in range(T_pred):
-            if frozen:
-                cumulative_action = cumulative_action + actions_out[:, t]
-                h = self.transport_frozen(anchor, cumulative_action, (t + 1) * dt, activate=prelift_mode)
-                if self._node_traj is not None:
-                    self._node_traj.append(self.node_velocity(h)[..., 0, 0].detach())
-            elif self.training and target is not None and random.random() < tf_ratio:
+            if self.training and target is not None and random.random() < tf_ratio:
                 frame = target[:, t]
             elif self.dec_input == "zero":
                 frame = torch.zeros_like(prev)
             else:
                 frame = prev
-            if not frozen:
-                h, wall = self.step(frame, h, actions_out[:, t], dt, wall)
+            h, wall = self.step(frame, h, actions_out[:, t], dt, wall)
             self._rel = actions_out[:, t] / dt if self.readout_rel else None
             out = self.decode(h, aux)
-            if digit_truth is not None:
-                from .diagnostics import concentration_at
-                aux["node_concentration"].append(concentration_at(self, h, digit_truth, t))
+            self._record_diagnostics(aux, h, digit_truth, t)
             outs.append(out)
             prev = out
         preds = torch.stack(outs, 1)
-        if return_aux:
+        return self._prediction_result(preds, aux, states, keep)
+
+    @staticmethod
+    def _prediction_result(preds, aux, states, keep):
+        if aux is not None:
             out = {k: torch.stack(v, 1) for k, v in aux.items()}
             if keep:
                 out["states"] = states
@@ -389,4 +411,4 @@ def build_model(args):
                      node_update_pred=(g("node_update_pred", "on") == "on"),
                      node_update=g("node_update", "lk"),
                      readout_rel=(g("readout_rel", "off") == "on"),
-                     grad_ckpt=g("grad_ckpt", False), frozen_k=g("frozen_k", 1))
+                     grad_ckpt=g("grad_ckpt", False))

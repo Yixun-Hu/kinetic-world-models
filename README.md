@@ -81,10 +81,13 @@ the default is `lk`. See [the method and evidence](docs/PR1_lock_nodes.md).
 
 `kwm.eval --dec_input {flowm,zero,frozen,frozen_prelift}` overrides prediction
 inputs; omitting it preserves the checkpoint's policy and output basenames.
-`--frozen_k K` controls the pre-lift variant's zero-input tail (default 1;
-K=0 freezes the exact final pre-lift tensor). `kwm.train --dec_input` accepts
-`flowm|zero|frozen_prelift`. See [prediction policies](docs/PR3_pred_input.md)
-and the [pilot gate](docs/GATE_pred_input.md) before using a frozen policy.
+The `frozen*` overrides are **experimental negative controls; failed the pilot
+gate**. `--frozen_k K` defaults to 0 (the exact final pre-lift tensor) and is
+only an explicit sweep knob: K>0 drops the last K observations and replays
+their camera actions with zeros. K=1 is effectively K=0 up to that dropped
+frame. `kwm.train --dec_input` accepts `flowm|zero` only. See
+[prediction policies and H3](docs/PR3_pred_input.md) and the
+[negative gate result and ghosting analysis](docs/GATE_pred_input.md).
 
 ```bash
 python -m venv .venv && source .venv/bin/activate

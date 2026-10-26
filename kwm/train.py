@@ -161,10 +161,8 @@ def get_parser():
     g.add_argument("--node_update_pred", default="on", choices=["on", "off"],
                    help="adaptive: update the nodes also from the model's own predictions (on, as in the "
                         "reported results) or only from observations (off, experimental)")
-    g.add_argument("--dec_input", default="flowm", choices=["flowm", "zero", "frozen_prelift"],
-                   help="prediction-phase input: previous prediction, zeros, or differentiable frozen transport")
-    g.add_argument("--frozen_k", type=int, default=1,
-                   help="frozen_prelift: zero-input tail length; 0 freezes final pre-lift content")
+    g.add_argument("--dec_input", default="flowm", choices=["flowm", "zero"],
+                   help="prediction-phase input: previous prediction or zeros")
     # walls (experimental)
     g = p.add_argument_group("collision operators (experimental)")
     g.add_argument("--collision", default="none", choices=list(COLLISIONS),

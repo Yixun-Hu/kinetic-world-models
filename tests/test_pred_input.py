@@ -1,11 +1,14 @@
 """Fast CPU regressions for prediction policies, transport, and ghosting metrics."""
 import copy
 import json
+from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
-from kwm.diagnostics import node_concentration, concentration_summary
+from kwm.diagnostics import (node_concentration, concentration_summary, effective_node_count,
+                             effective_count_summary)
 from kwm import eval as evaluate
 from kwm.equiv import boost_transform, equiv_error, interior_mask, target_mask
 from kwm.eval import configure_prediction, load_model, prediction_metadata, rollout
@@ -28,8 +31,10 @@ def cpu_threads():
 
 def model_for(kind, rule, **kwargs):
     torch.manual_seed(71)
-    return KineticWM(kind, C=2, world=12, window=8, imprint_k=2,
-                     node_update=rule, **kwargs)
+    mode = kwargs.pop("dec_input", "flowm")
+    m = KineticWM(kind, C=2, world=12, window=8, imprint_k=2, node_update=rule, **kwargs)
+    configure_prediction(m, {}, mode, m.frozen_k)
+    return m
 
 
 def inputs():
@@ -39,7 +44,7 @@ def inputs():
 
 
 def old_forward(model, obs, ain, aout):
-    """Pre-PR3 rollout, with the original cell feature expression as reference."""
+    """Loop-level reference sharing current step plumbing; golden test covers base code."""
     def original_update(u, hs, return_prelift=False):
         assert not return_prelift
         return model.cell.act(model.cell.lift(u, model.num_v) + model.cell.mix(hs))
@@ -71,6 +76,27 @@ def test_default_eval_bit_identical(kind, rule, mode):
         an = torch.cat([ain, aout], 1)
         actual, _ = rollout(m, fr, an, torch.zeros(1, 2), 5, 3, 1., 3, False, "cpu", aux=True)
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("kind,rule", KINDS)
+@pytest.mark.parametrize("mode", ["flowm", "zero"])
+def test_pre_pr3_checkpoint_no_override_matches_base_golden(kind, rule, mode, tmp_path):
+    # These checkpoint bytes and predictions were produced by git base 0c1198a,
+    # including its original cells, _step, build_model, load_model and rollout.
+    # Regenerate with tests/reference/generate_pred_input_golden.py.
+    path = Path(__file__).parent / "reference/pre_pr3_predictions.npz"
+    with np.load(path, allow_pickle=False) as golden:
+        key = f"{kind}_{rule}_{mode}"
+        assert str(golden["base"]).startswith("0c1198a")
+        (tmp_path / "last.pt").write_bytes(golden[key + "_checkpoint"].tobytes())
+        model, saved, step = load_model(tmp_path, "last", "cpu")
+        assert "frozen_k" not in saved and model.frozen_k == 0 and step == 17
+        assert configure_prediction(model, saved) == ""
+        with torch.no_grad():
+            actual, _ = rollout(model, torch.from_numpy(golden["frames"]),
+                                torch.from_numpy(golden["actions"]), torch.zeros(1, 2),
+                                5, 3, 1., 3, False, "cpu", aux=True)
+        assert torch.equal(actual, torch.from_numpy(golden[key + "_predictions"]))
 
 
 @pytest.mark.parametrize("kind,rule", KINDS)
@@ -186,6 +212,7 @@ def test_frozen_uses_carried_velocity_and_single_real_shift(rule):
 @pytest.mark.parametrize("mode,k", [("frozen", 1), ("frozen_prelift", 0), ("frozen_prelift", 2)])
 def test_frozen_comoving_boost_predictions(kind, rule, mode, k, monkeypatch):
     m = model_for(kind, rule, dec_input=mode, frozen_k=k, readout="max").eval()
+    # Comoving boost: viewport content stays identical; only camera actions move.
     # Fixed carried offsets isolate analytic-transport equivariance from estimator errors.
     if kind == "adaptive":
         m.cell.n_s.data.zero_()
@@ -220,28 +247,37 @@ def test_frozen_comoving_boost_predictions(kind, rule, mode, k, monkeypatch):
         assert (world_p - world_q).abs().max() < 1e-5
 
 
-@pytest.mark.parametrize("kind,rule", KINDS)
-@pytest.mark.parametrize("k", [0, 2])
-def test_prelift_training_gradients(kind, rule, k):
-    args = parse_args(["--model", kind, "--dec_input", "frozen_prelift", "--frozen_k", str(k)])
-    assert args.dec_input == "frozen_prelift" and args.frozen_k == k
-    m = model_for(kind, rule, dec_input=args.dec_input, frozen_k=k, grad_ckpt=True).train()
-    obs, ain, aout = inputs()
-    aout.requires_grad_()
-    obs.requires_grad_()
-    out = m(obs, ain, aout, target=torch.ones(1, 3, 1, 8, 8), tf_ratio=1.)
-    out.square().mean().backward()
-    for grad in (m.cell.conv_u.weight.grad, m.cell.conv_h.weight.grad, obs.grad, aout.grad):
-        assert grad is not None and torch.isfinite(grad).all() and grad.abs().sum() > 0
-    # Gradient checkpoint recomputation must match the uncheckpointed graph.
-    plain = copy.deepcopy(m)
-    plain.grad_ckpt = False
-    plain.zero_grad(set_to_none=True)
-    x, a, b = inputs()
-    plain(x, a, b).square().mean().backward()
-    for p, q in zip(m.parameters(), plain.parameters()):
-        if p.grad is not None:
-            torch.testing.assert_close(p.grad, q.grad, rtol=1e-5, atol=1e-7)
+@pytest.mark.parametrize("mode", ["frozen", "frozen_prelift"])
+def test_frozen_modes_are_eval_only(mode):
+    with pytest.raises(SystemExit):
+        parse_args(["--dec_input", mode])
+    with pytest.raises(ValueError, match="eval overrides"):
+        build_model(dict(model="spectral", dec_input=mode))
+    m = model_for("spectral", "lk", dec_input=mode).train()
+    with pytest.raises(ValueError, match="evaluation-only"):
+        m(*inputs())
+
+
+def test_training_args_have_no_frozen_knob():
+    assert parse_args([]).dec_input == "flowm"
+    assert parse_args(["--dec_input", "zero"]).dec_input == "zero"
+    assert not hasattr(parse_args([]), "frozen_k")
+    with pytest.raises(SystemExit):
+        parse_args(["--frozen_k", "0"])
+
+
+def test_effective_nodes_entropy_before_spatial_averaging():
+    feat = torch.ones(1, 4, 2, 2, 2)
+    assert effective_node_count(feat).item() == pytest.approx(4.)
+    feat.zero_()
+    # Each pixel belongs to a different node: per-pixel count is 1, whereas
+    # entropy after spatial pooling would incorrectly report 4.
+    for node in range(4):
+        feat[:, node, :, node // 2, node % 2] = 1
+    assert effective_node_count(feat).item() == pytest.approx(1.)
+    assert effective_node_count(feat * 0).item() == 0
+    values = torch.tensor([[4., 1., 3.], [2., 3., 1.]])
+    assert effective_count_summary(values) == {"0": 3., "1": 2., "mean_prediction": 2.}
 
 
 def test_concentration_oracle_and_edge_cases():
@@ -263,8 +299,8 @@ def test_concentration_oracle_and_edge_cases():
 
 
 def test_oracle_one_digit_rollout_concentration(monkeypatch):
-    m = KineticWM("oracle", C=1, world=8, window=8, n_digits=1,
-                  readout="max", dec_input="frozen").eval()
+    m = KineticWM("oracle", C=1, world=8, window=8, n_digits=1, readout="max").eval()
+    configure_prediction(m, {}, "frozen")
     nodes = torch.tensor([[[0., 0.], [1., 0.]]])
     h = torch.zeros(1, 2, 1, 8, 8)
     h[:, 1, :, 2:5, 2:5] = 1
@@ -306,17 +342,22 @@ def test_eval_aux_concentration_all_modes(mode):
     assert torch.equal(actual, expected)
     values = aux["node_concentration"]
     assert values.shape == (1, 3, 1) and ((values >= 0) & (values <= 1)).all()
+    counts = aux["effective_node_count"]
+    assert counts.shape == (1, 4) and ((counts >= 0) & (counts <= m.num_v + 1e-5)).all()
 
 
-@pytest.mark.parametrize("saved", ["flowm", "zero", "frozen", "frozen_prelift"])
+@pytest.mark.parametrize("saved", ["flowm", "zero"])
 def test_filename_suffix(saved):
-    m = model_for("spectral", "lk")
+    m = model_for("spectral", "lk").eval()
     assert configure_prediction(m, {"dec_input": saved}) == ""
     assert configure_prediction(m, {"dec_input": saved}, saved) == ""
     for mode in ("flowm", "zero", "frozen", "frozen_prelift"):
         assert configure_prediction(m, {"dec_input": saved}, mode) == ("" if mode == saved else f"_dec{mode}")
-    assert configure_prediction(m, {"dec_input": "flowm"}, "frozen_prelift", 0) == "_decfrozen_prelift_fk0"
-    assert configure_prediction(m, {"dec_input": "frozen_prelift", "frozen_k": 4}) == ""
+    assert configure_prediction(m, {"dec_input": "flowm"}, "frozen_prelift", 0) == "_decfrozen_prelift"
+    assert m.frozen_k == 0
+    assert configure_prediction(m, {"dec_input": "flowm", "frozen_k": 1}, "frozen_prelift") == "_decfrozen_prelift"
+    assert m.frozen_k == 0  # transient PR3 training arguments cannot silently select K>0
+    assert configure_prediction(m, {"dec_input": "flowm"}, "frozen_prelift", 4) == "_decfrozen_prelift_fk4"
     with pytest.raises(ValueError, match="nonnegative"):
         configure_prediction(m, {}, "frozen_prelift", -1)
     m.frozen_k = 5
@@ -345,12 +386,19 @@ def test_eval_cli_metadata_and_actual_filenames(tmp_path, monkeypatch, capsys):
     assert set(before) == {"eval.json", "samples.png", "mse_curve.png"}
     evaluate.main(flags + ["--dec_input", "flowm"])
     assert before == {p.name: p.read_bytes() for p in out.iterdir()}
-    evaluate.main(flags + ["--dec_input", "frozen_prelift", "--frozen_k", "0", "--node_update_pred", "on"])
-    suffix = "_decfrozen_prelift_fk0"
+    # Frozen overrides also work with the default throughput benchmark enabled:
+    # inference is measured, while unsupported frozen training is skipped.
+    evaluate.main([f for f in flags if f != "--skip_tp"] +
+                  ["--dec_input", "frozen_prelift", "--frozen_k", "0", "--node_update_pred", "on"])
+    suffix = "_decfrozen_prelift"
     assert {f"eval{suffix}.json", f"samples{suffix}.png", f"mse_curve{suffix}.png"} <= {p.name for p in out.iterdir()}
     result = json.loads((out / f"eval{suffix}.json").read_text())
     assert result["dec_input"] == "frozen_prelift" and result["frozen_k"] == 0
     assert result["node_update_pred_ignored"] and result["node_update_pred"] is False
     assert set(result["node_concentration"]) == {"1", "10", "20"}
     assert all(0 <= v <= 1 for v in result["node_concentration"].values())
+    assert set(result["effective_node_count"]) == {"0", "1", "10", "20", "mean_prediction"}
+    assert result["throughput"]["train_step_ms"] is None
+    assert result["throughput"]["infer_ms_per_seq"] > 0
+    assert result["throughput"]["training_skipped"] == "frozen modes are evaluation-only"
     capsys.readouterr()

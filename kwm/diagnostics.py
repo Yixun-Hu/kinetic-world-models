@@ -41,6 +41,31 @@ def concentration_at(model, h, truth, t):
                               truth["vel"][:, t], masks, truth["visible"][:, t])
 
 
+@torch.no_grad()
+def effective_node_count(feat):
+    """[B] mean over pixels of exp(entropy(node squared-energy distribution)).
+
+    Compute entropy per pixel, before spatial averaging; zero-energy pixels
+    have zero effective nodes. Feature channels only, without metadata.
+    """
+    energy = feat.float().square().sum(2)
+    total = energy.sum(1, keepdim=True)
+    share = energy / total.clamp_min(1e-30)
+    count = (-(share * share.clamp_min(1e-30).log()).sum(1)).exp()
+    return count.masked_fill(total[:, 0] == 0, 0).mean((-2, -1))
+
+
+def effective_count_at(model, h):
+    return effective_node_count(features(h)[:, :, :model.C, :model.window, :model.window])
+
+
+def effective_count_summary(values):
+    """values [B,1+T_pred], ordinary observation state followed by predictions."""
+    out = {str(t): float(values[:, t].mean()) for t in (0, 1, 10, 20) if t < values.shape[1]}
+    out["mean_prediction"] = float(values[:, 1:].mean()) if values.shape[1] > 1 else None
+    return out
+
+
 def prediction_truth(cache, sl, T_obs, T_pred, device):
     """Compact cache labels for aux only, indexed from the first prediction."""
     truth = {k: cache[k][sl, T_obs:T_obs + T_pred].to(device)

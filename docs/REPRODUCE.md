@@ -159,21 +159,32 @@ python scripts/panorama_figs.py    # panorama*.png, velocity_space*.png, rollout
 Use the existing review selection cache and read-only pilot checkpoints. The
 script writes only to `results/pred_input_gate/` in this checkout. MSE@H means
 the mean over the **first H** predicted frames, with predictions clamped to
-[0,1]. It also records nearest-node concentration, checkpoint/cache hashes,
-per-sequence errors and CPU/wall time. See [the gate](GATE_pred_input.md).
+[0,1]. It also records nearest-node concentration, per-pixel effective node
+count, checkpoint/cache hashes, per-sequence errors and CPU/core time. Use
+`--variants` to reproduce the script-only de-ghosting, mix-once and
+zero-then-freeze experiments. See [the gate](GATE_pred_input.md).
 
 ```bash
-CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=8 OPENBLAS_NUM_THREADS=1 \
+CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1 \
   /home/yixunhu/miniconda3/envs/flowm/bin/python scripts/pred_input_gate.py \
   --runs /home/yixunhu/codespace/kinetic-world-models/runs \
   --cache /home/yixunhu/codespace/kinetic-world-models/results/val_cache_w50_vel1_cam1_walls0_n32_T30+150.pt \
-  --n 16 --threads 8 --lock_ckpt ckpt_step10000 --lk_ckpt ckpt_step13000
+  --n 16 --threads 4 --lock_ckpt ckpt_step10000 --lk_ckpt ckpt_step13000 --variants
 ```
 
-The gate evaluated `last.pt`; these archives have identical model weights and
-pin the measured steps despite ongoing training. Omit the two checkpoint flags
-to evaluate the latest pilots instead. The reviewer's older outputs used steps
-9000/11000 and 32 sequences; this gate uses the permitted first-16 fallback.
+The defaults pin those archives and 16 sequences. The default pre-lift sweep is
+K=0/4; use `--ks` only for an explicit additional sweep. The observation pass is
+shared across policies, each fixed anchor's FFT is cached, LK's carried
+velocity metadata is compacted for frozen decoding, the frozen and
+mix-once rows share transports, and the zero-then-freeze row reuses zero's first
+20 steps. Matching flowm/zero JSONs are reused from `--out` (or `--baseline-dir`)
+after checking checkpoint/cache hashes, sample count, numerical-dependency
+source hashes, software versions and thread count; original baseline provenance
+is retained. Use `--refresh-baselines` to recompute. Older last.pt JSONs are refreshed
+once because their archive hashes and effective-node diagnostics are absent.
+`runtime.json` reports actual process totals without double-counting shared
+work. The reviewer's older robustness checks used steps 9000/11000 and 32
+sequences; they are identified separately from this first-16 reproduction.
 
 For general evaluation of one policy:
 
@@ -182,6 +193,6 @@ CUDA_VISIBLE_DEVICES="" python -m kwm.eval --run runs/pilot_lock --ckpt last \
   --device cpu --dec_input frozen_prelift --frozen_k 0 --skip_tp
 ```
 
-For differentiable pre-lift training, add `--dec_input frozen_prelift
---frozen_k 1` to the training command. This is experimental; consult the gate
-before using it as a forecasting policy.
+Frozen overrides are experimental negative controls that failed the pilot
+gate. Training accepts `--dec_input flowm|zero` only; `--frozen_k` is an
+evaluation sweep knob and defaults to 0.
