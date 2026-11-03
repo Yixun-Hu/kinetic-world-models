@@ -582,7 +582,7 @@ def run_estimator(spec, frames, actions, cell, batch_size, device, max_seconds=N
     peak = 0
     for first in range(0, len(frames), batch_size):
         f, a = frames[first:first + batch_size].to(device), actions[first:first + batch_size].to(device)
-        estimator = Estimator(spec, len(f), device, c4=cell.rot == "c4")
+        estimator = Estimator(spec, len(f), device, c4=cell.c4_numerics)
         trajectory = []
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
@@ -615,7 +615,7 @@ def benchmark(spec, frames, actions, cell, device, repeats):
     """
     indices = torch.arange(16) % len(frames)
     f, a = frames[indices].to(device), actions[indices].to(device)
-    estimator = Estimator(spec, 16, device, c4=cell.rot == "c4")
+    estimator = Estimator(spec, 16, device, c4=cell.c4_numerics)
     samples = []
     for t in range(9 + repeats):
         sync(device)
@@ -640,7 +640,7 @@ def benchmark_costs(frames, actions, cell, repeats=11):
     specs = [s for s in SPECS if s.family == "S" or (s.family == "D" and s.modes)]
     result = {}
     for spec in [None] + specs:
-        estimator = None if spec is None else Estimator(spec, 16, torch.device("cpu"), c4=cell.rot == "c4")
+        estimator = None if spec is None else Estimator(spec, 16, torch.device("cpu"), c4=cell.c4_numerics)
         samples = []
         for t in range(9 + repeats):
             start = time.perf_counter()
@@ -870,7 +870,7 @@ def self_check(cell):
                        gen=torch.Generator().manual_seed(93), split="test")
     f, a = batch["frames"].to(device), batch["actions"].to(device)
     for spec in SPECS[:2]:
-        estimator = Estimator(spec, 2, device, c4=cell.rot == "c4")
+        estimator = Estimator(spec, 2, device, c4=cell.c4_numerics)
         cell.step_clip = 0.3 if spec.step_clip is not None else math.inf
         h = torch.zeros(2, 25, 43, WORLD, WORLD, device=device)
         for t in range(6):
@@ -951,7 +951,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--n", type=int, default=300)
     parser.add_argument("--seed", type=int, default=2024)
-    parser.add_argument("--rot", choices=("none", "c4"), default="none", help="random encoder and transport symmetry")
+    parser.add_argument("--rot", choices=("none", "c4", "none_c4num"), default="none", help="random encoder and transport symmetry")
+    parser.add_argument("--encoder-seed", type=int, default=0, help="frozen random encoder initialization")
     parser.add_argument("--dataset-size", type=int, help="generate this many sequences before slicing")
     parser.add_argument("--start-index", type=int, default=0, help="first sequence in the generated dataset")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
@@ -972,7 +973,7 @@ def main():
     parser.add_argument("--prediction-seed", type=int, default=778)
     parser.add_argument("--prediction-cache", type=Path)
     args = parser.parse_args()
-    if args.rot == "c4" and args.parity_reference:
+    if args.rot != "none" and args.parity_reference:
         parser.error("historical parity references use legacy transport; use --rot none")
     if args.pool_results:
         result = pool_results(args.pool_results)
@@ -1007,7 +1008,7 @@ def main():
     torch.set_num_threads(1)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    torch.manual_seed(0)
+    torch.manual_seed(args.encoder_seed)
     cell = AdaptiveNodeCell(C=32, num_v=25, rot=args.rot).eval().to(device)
     for parameter in cell.parameters():
         parameter.requires_grad_(False)
@@ -1042,7 +1043,7 @@ def main():
         payload = dict(schema_version=2, complete=False,
                        requested_estimators=[s.name for s in specs], completed_estimators=[],
                        config={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
-                       environment=batch["cfg"], seed=args.seed, cell_seed=0, observed_frames=30,
+                       environment=batch["cfg"], seed=args.seed, cell_seed=args.encoder_seed, observed_frames=30,
                        imprint="untrained AdaptiveNodeCell(C=32,num_v=25), K=8, fixed P, s=1",
                        dtype="float32; autocast and TF32 disabled", dataset_sha256=digest,
                        torch_version=torch.__version__, device=str(device),

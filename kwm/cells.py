@@ -42,9 +42,11 @@ class _Base(nn.Module):
     def __init__(self, in_ch, C, world, window, rot="none"):
         super().__init__()
         self.C, self.world, self.window = C, world, window
-        if rot not in ("none", "c4") or (rot == "c4" and C % 4):
-            raise ValueError("rot must be none or c4; c4 requires C divisible by 4")
+        if rot not in ("none", "none_c4num", "c4") or (rot == "c4" and C % 4):
+            raise ValueError("rot must be none, none_c4num or c4; c4 requires C divisible by 4")
         self.rot = rot
+        # Independent of weight tying: none_c4num is the untied control arm.
+        self.c4_numerics = rot in ("c4", "none_c4num")
         if rot == "c4":
             self.conv_u = GConvLift(in_ch, C // 4)
             self.conv_h = GConvRegular(C // 4, C // 4)
@@ -104,7 +106,7 @@ class KineticCell(_Base):
         # Common kinetic-cell interface; this cell's nodes are always fixed.
         if collision is not None:
             h_prev = collision(h_prev)
-        hs = stream(h_prev, nodes, action, dt, c4=self.rot == "c4")
+        hs = stream(h_prev, nodes, action, dt, c4=self.c4_numerics)
         return self.feature_update(u_t, hs, return_prelift)
 
 
@@ -220,7 +222,7 @@ class AdaptiveNodeCell(_Base):
             h_prev = collision(h_prev)
         rho = self.offsets(h_prev)
         nu = nodes[None].float() + rho                                              # [B,V,2]
-        hs = stream(h_prev, nu, action, dt, c4=self.rot == "c4")
+        hs = stream(h_prev, nu, action, dt, c4=self.c4_numerics)
         feat, m = hs[:, :, :C], hs[:, :, C + E:]
         win = u_t.shape[-1]
         u = self.conv_u(u_t)
@@ -261,14 +263,14 @@ class AdaptiveNodeCell(_Base):
         rho = self.offsets(h_prev)
         with torch.autocast(device_type=u_t.device.type, enabled=False):
             nu = nodes[None].float() + rho
-            feat = stream(h_prev.features, nu, action.float(), dt, c4=self.rot == "c4")
+            feat = stream(h_prev.features, nu, action.float(), dt, c4=self.c4_numerics)
         if update_nodes:
             u = self.conv_u(u_t)
             with torch.autocast(device_type=u_t.device.type, enabled=False):
                 pu = self.imprint(u.float())
                 delta, evidence, locked = lock_measurement(
                     h_prev.snapshot, pu, nu, nodes, action, self.world, dt,
-                    self.lam_rel, self.tr_rel, self.gate, self.coh_rel, self.bound, c4=self.rot == "c4")
+                    self.lam_rel, self.tr_rel, self.gate, self.coh_rel, self.bound, c4=self.c4_numerics)
                 W_new = h_prev.nodes[..., 2:3] + evidence[..., None]
                 gain = evidence[..., None] / W_new.clamp_min(1e-6)
                 # Form the residual from the measured velocity in fp32.

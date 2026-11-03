@@ -42,7 +42,6 @@ from .collision import (lattice_nodes, reflection_perms, bounce_back, rigid_boun
                         known_wall_field, WallEncoder, VMixing, MLPCollision)
 from .transport import spectral_shift, stream
 from .gconv import GConvRegular, GConvInvariantOut, MomentProjection
-from .rot import rotation_perms
 
 MODELS = ("flowm", "spectral", "adaptive", "oracle")
 COLLISIONS = ("none", "bounce", "vmix", "mlp")
@@ -121,8 +120,6 @@ class KineticWM(nn.Module):
             else:
                 self.cell = KineticCell(in_ch, C, world, window, num_v=V, rot=rot)
         self.num_v = self.cell.num_v
-        if rot == "c4" and not self.oracle:
-            self.register_buffer("perm_rot", rotation_perms(self.nodes()), persistent=False)
         self._node_traj = None
         self.readout = readout or "moments"
 
@@ -151,6 +148,11 @@ class KineticWM(nn.Module):
         self.decoder_conv = nn.Sequential(*dec)
 
     # ------------------------------------------------------------------
+    @property
+    def c4_numerics(self):
+        """Transport, readout floor and SSD arithmetic, independent of tying."""
+        return self.cell.c4_numerics
+
     def initial_state(self, observation):
         """Allocate the recurrence's tensor or compact LockState."""
         if self.kind == "adaptive":
@@ -171,8 +173,8 @@ class KineticWM(nn.Module):
         """hw [B,V,C,h,w] -> softmax weights over V [B,V,h,w]."""
         e = hw.norm(dim=2)
         # Empty pixels otherwise amplify fp32 FFT roundoff into velocity signal.
-        # C4 keeps this invariant floor above the numerical transport noise.
-        eps = 1e-2 if self.rot == "c4" else 1e-6
+        # C4 and its untied numerical control share this invariant floor.
+        eps = 1e-2 if self.c4_numerics else 1e-6
         e = e / (e.amax(1, keepdim=True) + eps)
         if beta is None:
             beta = self.log_beta.exp() if hasattr(self, "log_beta") else 10.0
@@ -252,7 +254,7 @@ class KineticWM(nn.Module):
     def step(self, frame, h, a, dt, wall, *, return_prelift=False):
         # Capture the phase before checkpointing: forward() restores the mutable
         # legacy flag before backward recomputes the prediction steps.
-        update = self.cell.update_nodes if self.kind == "adaptive" and (self.node_update == "lock" or self.rot == "c4") else None
+        update = self.cell.update_nodes if self.kind == "adaptive" else None
         if self.grad_ckpt and self.training and torch.is_grad_enabled():
             if wall is None:
                 return ckpt.checkpoint(lambda f, hh, aa: self._step(f, hh, aa, dt, None, update, return_prelift),
@@ -270,7 +272,7 @@ class KineticWM(nn.Module):
     def transport_frozen(self, h, cumulative_action, elapsed, activate=False):
         """One spectral shift from the anchor, including carried adaptive velocity."""
         nu = self.node_velocity(h)[..., 0, 0]
-        feat = stream(features(h)[:, :, :self.C], nu, cumulative_action, elapsed, c4=self.rot == "c4")
+        feat = stream(features(h)[:, :, :self.C], nu, cumulative_action, elapsed, c4=self.c4_numerics)
         if activate:
             feat = self.cell.act(feat)
         return self.with_features(h, feat)

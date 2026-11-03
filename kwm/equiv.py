@@ -27,8 +27,8 @@ def _lattice_index(nodes, spacing):
     return ij, lo, n, table
 
 
-def boost_transform(h, nodes, spacing, C, nu_hat, t):
-    """Apply the boost nu_hat ([B,2]) to the feature channels of memory h ([B,V,>=C,H,W]) observed for t steps."""
+def boost_transform(h, nodes, spacing, C, nu_hat, t, *, c4=False):
+    """Apply a boost to memory features; pass c4=model.c4_numerics to match its transport."""
     h = features(h)
     B, V, _, H, W = h.shape
     dev = h.device
@@ -43,7 +43,7 @@ def boost_transform(h, nodes, spacing, C, nu_hat, t):
     idx = torch.where(valid, idx, torch.zeros_like(idx))
     vm = valid[:, :, None].to(h.dtype)
     out = torch.zeros_like(feat).scatter_add_(1, idx[:, :, None].expand_as(feat), feat * vm)
-    return spectral_shift(out, nu_hat * t)
+    return spectral_shift(out, nu_hat * t, c4=c4)
 
 
 def target_mask(nodes, spacing, nu_hat):

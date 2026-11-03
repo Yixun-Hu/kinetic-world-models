@@ -1,11 +1,84 @@
 {
-  "n": 32,
+  "rot_equiv_error": {
+    "1": {
+      "1": {
+        "mean": 8.87702356067166e-07,
+        "max": 6.4891505644482095e-06
+      },
+      "4": {
+        "mean": 6.878165095258737e-07,
+        "max": 4.5645670070371125e-06
+      }
+    },
+    "2": {
+      "1": {
+        "mean": 8.191249207811779e-07,
+        "max": 4.379790880193468e-06
+      },
+      "4": {
+        "mean": 6.546579243149608e-07,
+        "max": 3.3230478493351256e-06
+      }
+    },
+    "3": {
+      "1": {
+        "mean": 1.0578037290542852e-06,
+        "max": 7.942129741422832e-06
+      },
+      "4": {
+        "mean": 3.075087442994118e-05,
+        "max": 0.0009616207680664957
+      }
+    }
+  },
+  "ulp_baseline": {
+    "1": {
+      "mean": 9.162055221167975e-07,
+      "max": 8.999192687042523e-06
+    },
+    "4": {
+      "mean": 3.0672184948343784e-05,
+      "max": 0.0009617541218176484
+    }
+  },
   "seed": 777,
+  "batch_size": 4,
   "C": 8,
   "model_seed": 9,
-  "node_update": "lock",
-  "observation_steps": 6,
-  "prediction_steps": 4,
-  "rot_equiv_error": 6.878165095258737e-07,
-  "seconds": 74.30487445741892
+  "rot": "c4",
+  "t_obs": 6,
+  "t_pred": 4,
+  "n": 32,
+  "dtype": "float32",
+  "tf32": false,
+  "device": "cpu",
+  "perturbation": "torch.nextafter(obs.float(), +inf)",
+  "metric": "per-sequence prefix normalized L2",
+  "seconds": 185.7516481168568,
+  "provenance": {
+    "git_head": "cdfe0b23382271c958042e44c961efe5ed8e0d64",
+    "git_dirty": true,
+    "files": {
+      "kwm/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "kwm/cells.py": "bc5fafb2bd5ac5cdc04e4e4c1e7e29f10ed3beb7368ab489b323672945e4fddf",
+      "kwm/collision.py": "c2fb51062378200ad7b4e1a757009c7c6f0742fe0148ebe31072064168cdd87e",
+      "kwm/diagnostics.py": "c36823ea4f29384afbfe59dc0dd2b354a9e973d4225660bcc979b83b0dad1ee7",
+      "kwm/env.py": "ddbc473ab38b0d39d022603dfa5e7daf30d910a4f4512340663435883cb9a8c9",
+      "kwm/equiv.py": "d9a29e676e6c8661d29cfb1a9b584ef174d5fd5527ce66a7cac4c2ab57d9e0b6",
+      "kwm/eval.py": "30ca2baff4ce8e7bcc7cc5d368ea04f3d9a6500cbff111a880a59a536a4deb92",
+      "kwm/gconv.py": "22e606002f8787cc267ec4fdf14165616cfdbc9cf1297f007db2c3ccefd6689a",
+      "kwm/lock_nodes.py": "b16eb9842e56ab2f1bb35e523633bab110e1ffed3a72f3ac4d4e5319c2b9c3c2",
+      "kwm/model.py": "e5aa63d83d4617aa593d17d2f9b1d5e4cda06ed41422a9ece5a818c644e6572c",
+      "kwm/provenance.py": "7890656694d380c7ccf6e629635183ff11e543d04ea4ef280c562980cd180760",
+      "kwm/rot.py": "63ad56b407c9b54e766f6b16349428a58783e17db8183ebaddf2e34b2a183d0c",
+      "kwm/train.py": "dbb88bf171523e3d3ea726a450545203042c40cced3d4c8dde56862b3cefc61b",
+      "kwm/transport.py": "7587b57417631113af40e8abc37985809f5896fe3ef93af1d23c4b5d0e1feee5"
+    },
+    "software": {
+      "python": "3.12.15",
+      "torch": "2.9.0+cu128",
+      "numpy": "1.26.4",
+      "cuda_available": false
+    }
+  }
 }

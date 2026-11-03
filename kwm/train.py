@@ -147,7 +147,8 @@ def get_parser():
     # model
     g = p.add_argument_group("model")
     g.add_argument("--C", type=int, default=32, help="hidden channels")
-    g.add_argument("--rot", choices=["none", "c4"], default="none", help="C4 rotation equivariance (requires C % 4 == 0)")
+    g.add_argument("--rot", choices=["none", "c4", "none_c4num"], default="none",
+                   help="C4 rotation equivariance (requires C %% 4 == 0); none_c4num is an internal untied numerical control")
     g.add_argument("--node_spacing", type=float, default=1.0, help="velocity lattice spacing (1.0: 25 nodes)")
     g.add_argument("--readout", default=None, choices=[None, "max", "moments"],
                    help="default: max for flowm, moments otherwise")

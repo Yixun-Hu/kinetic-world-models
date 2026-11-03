@@ -33,9 +33,15 @@ their true positions while they are out of view.*
   fractional-time prediction, and equivariance under real-valued boosts.
 - The scripts and figures behind `docs/RESULTS.md`.
 
-`python -m kwm.train --rot c4` enables C4 rotation equivariance (`C % 4 == 0`;
-default `--rot none` is unchanged). `python -m kwm.eval --run RUN --rot_check`
-checks 32 held-out rotated episodes. See [PR6: C4 rotation](docs/PR6_c4_rotation.md).
+`python -m kwm.train --rot c4` enables C4 rotation equivariance (`C % 4 == 0`),
+up to the lock estimator's rounding sensitivity. `python -m kwm.eval --run RUN
+--rot_check` checks all quarter turns on up to 32 held-out episodes, reporting
+mean/max errors at horizons 1, 4, 20 and the full rollout (normally 150) alongside a one-ulp baseline.
+No regression is demonstrated by the 12-sequence multi-seed estimator slice;
+it is not a model-selection tool. Default `--rot none` preserves bit-identity except
+for the corrected LK checkpoint backward pass with prediction updates off;
+see [PR6: C4 rotation](docs/PR6_c4_rotation.md) for evidence and the precise exception.
+Internal control: `--rot none_c4num` keeps untied layers with the three C4 numerical changes.
 
 ## Main result
 

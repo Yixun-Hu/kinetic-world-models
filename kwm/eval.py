@@ -170,7 +170,8 @@ def equiv_memory(model, args, cfg, n, device, ts=(10, 30), seed=777, chunk=16, m
                     runs.append(aux["states"])
                 for t in ts:
                     disp_t = t if em == "scene" else 0
-                    ht = boost_transform(runs[0][t], nodes, spacing, model.C, nb.to(device), disp_t)
+                    ht = boost_transform(runs[0][t], nodes, spacing, model.C, nb.to(device), disp_t,
+                                         c4=model.c4_numerics)
                     mask = target_mask(nodes, spacing, nb.to(device))
                     mask = mask & interior_mask(nodes, spacing).to(mask.device)[None]   # interior nodes only
                     errs[t] += equiv_error(ht, runs[1][t], model.C, mask).tolist()
@@ -282,22 +283,59 @@ def node_velocity_error(model, cache, T_obs, device, n=64, bs=16):
 
 @torch.no_grad()
 def rotation_check(model, cache, T_obs, device, n=32, bs=4):
-    """Unclamped fp32 predictions on held-out episodes and their quarter turns."""
+    """Prefix prediction nL2 for all quarter turns and a one-fp32-ulp control.
+
+    At each horizon h, normalise the discrepancy over frames [:h] separately
+    for each sequence, then report its mean and maximum over <=32 sequences.
+    The control advances every observed pixel one representable fp32 value
+    toward +inf (including zeros), with actions and oracle nodes unchanged.
+    TF32 and autocast are disabled for all five forwards, then restored.
+    """
     from .rot import rot_episode, rot_map, rot_nodes, normalized_error
     if model.collision_kind != "none":
         raise ValueError("rot_check currently requires --collision none")
-    errors = []
-    for start in range(0, min(n, len(cache["frames"])), bs):
-        frames = cache["frames"][start:start + min(bs, n - start)].float().to(device)
-        actions = cache["actions_noisy"][start:start + len(frames)].float().to(device)
-        obs, ain, aout = frames[:, :T_obs], actions[:, :T_obs], actions[:, T_obs:]
-        robs, rain, raout, _ = rot_episode(obs, ain, aout, k=1)
-        nodes = oracle_nodes_from(cache["vel"][start:start + len(frames), 0].to(device)) if model.oracle else None
-        with torch.autocast(device_type=device.split(":")[0], enabled=False):
-            pred = model(obs, ain, aout, nodes=nodes)
-            rotated = model(robs, rain, raout, nodes=None if nodes is None else rot_nodes(nodes))
-        errors.append(normalized_error(rot_map(pred, window=model.window), rotated).cpu())
-    return torch.cat(errors).mean().item()
+    n = min(n, 32, len(cache["frames"]))
+    horizon = cache["actions_noisy"].shape[1] - T_obs
+    if n < 1 or bs < 1 or horizon < 1:
+        raise ValueError("rot_check needs sequences, a positive batch size and prediction horizon")
+    horizons = sorted({h for h in (1, 4, 20, horizon) if h <= horizon})
+    errors = {k: {h: [] for h in horizons} for k in (1, 2, 3)}
+    baseline = {h: [] for h in horizons}
+
+    def collect(destination, expected, actual):
+        for h in horizons:
+            destination[h].append(normalized_error(expected[:, :h], actual[:, :h]).cpu())
+
+    tf32 = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        with torch.autocast(device_type=torch.device(device).type, enabled=False):
+            for start in range(0, n, bs):
+                sl = slice(start, min(start + bs, n))
+                frames = cache["frames"][sl].float().to(device)
+                actions = cache["actions_noisy"][sl].float().to(device)
+                obs, ain, aout = frames[:, :T_obs], actions[:, :T_obs], actions[:, T_obs:]
+                nodes = oracle_nodes_from(cache["vel"][sl, 0].float().to(device)) if model.oracle else None
+                pred = model(obs, ain, aout, nodes=nodes)
+                perturbed = torch.nextafter(obs, torch.full_like(obs, float("inf")))
+                collect(baseline, pred, model(perturbed, ain, aout, nodes=nodes))
+                for k in (1, 2, 3):
+                    robs, rain, raout, _ = rot_episode(obs, ain, aout, k=k)
+                    rotated = model(robs, rain, raout, nodes=None if nodes is None else rot_nodes(nodes, k))
+                    collect(errors[k], rot_map(pred, k, window=model.window), rotated)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = tf32
+
+    def summary(values):
+        out = {}
+        for h, chunks in values.items():
+            error = torch.cat(chunks)
+            out[h] = dict(mean=error.mean().item(), max=error.max().item())
+        return out
+
+    return dict(rot_equiv_error={k: summary(values) for k, values in errors.items()},
+                ulp_baseline=summary(baseline))
 
 
 def main(argv=None):
@@ -333,7 +371,8 @@ def main(argv=None):
                    help="zero_then_frozen only: run N zero-input prediction steps, then freeze (default 20; N>=0)")
     # boost equivariance (on / off the velocity lattice)
     p.add_argument("--equiv_boost", action="store_true", help="boost equivariance of the memory (t=10,30) and of the predictions (t=10,20)")
-    p.add_argument("--rot_check", action="store_true", help="fp32 C4 sanity check on 32 held-out sequences")
+    p.add_argument("--rot_check", action="store_true",
+                   help="fp32 C4 check with a one-ulp baseline on min(n_val, 32) held-out sequences")
     p.add_argument("--n_equiv", type=int, default=48)
     p.add_argument("--only_equiv", action="store_true",
                    help="skip everything but the equivariance tests; the result is MERGED into an existing eval<tag>.json")
@@ -381,11 +420,17 @@ def main(argv=None):
     if a.rot_check:
         # Always held out from selection, even when the main eval uses VAL_SEED.
         rotation_seed = test_seed if test_seed != VAL_SEED else 777
-        rotation_cache = val_cache(cfg, 32, T_obs=T_obs, device=device, seed=rotation_seed)
-        res["rot_equiv_error"] = rotation_check(model, rotation_cache, T_obs, device)
+        rotation_n = min(32, n_val)
+        rotation_cache = val_cache(cfg, rotation_n, T_obs=T_obs, device=device, seed=rotation_seed)
+        res.update(rotation_check(model, rotation_cache, T_obs, device, n=rotation_n, bs=min(4, a.bs)))
         res["sets"]["rot_equiv_error"] = dict(seed=rotation_seed, mnist_split="test", role="heldout",
-                                               n=32, k=1, t_obs=T_obs, t_pred=T_pred, amp=False)
+                                               n=rotation_n, k=[1, 2, 3], t_obs=T_obs, t_pred=T_pred,
+                                               horizons=list(res["ulp_baseline"]), amp=False, tf32=False,
+                                               metric="per-sequence prefix normalized L2")
+        res["sets"]["ulp_baseline"] = dict(res["sets"]["rot_equiv_error"], k=0,
+                                           perturbation="torch.nextafter(obs.float(), +inf)")
         print("[rot_equiv_error]", res["rot_equiv_error"])
+        print("[ulp_baseline]", res["ulp_baseline"])
 
     # ---------------- adaptive: node velocity error at the end of the observation ----------------
     if args["model"] == "adaptive" and not cfg.walls:
@@ -412,11 +457,11 @@ def main(argv=None):
     if a.only_equiv:
         path = os.path.join(out_dir, f"eval{sfx}.json")
         old = json.load(open(path)) if os.path.exists(path) else {}
-        old.update({k: v for k, v in res.items() if k in ("equiv", "equiv_output", "rot_equiv_error")})
+        old.update({k: v for k, v in res.items() if k in ("equiv", "equiv_output", "rot_equiv_error", "ulp_baseline")})
         # A merged file may contain metrics from an earlier invocation. Keep their
         # provenance, and identify the invocation that produced each new diagnostic.
         diagnostic_keys = ("provenance", "ckpt_provenance", "seed", "test_seed", "sets")
-        for key in ("equiv", "equiv_output", "rot_equiv_error"):
+        for key in ("equiv", "equiv_output", "rot_equiv_error", "ulp_baseline"):
             if key in res:
                 old.setdefault("diagnostic_provenance", {})[key] = dict(
                     {k: res[k] for k in diagnostic_keys}, ckpt=a.ckpt, step=step)

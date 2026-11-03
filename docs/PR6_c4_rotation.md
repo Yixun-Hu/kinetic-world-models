@@ -3,18 +3,17 @@
 Enable with `python -m kwm.train --rot c4`. The checkpoint records `rot`, and
 `build_model` and evaluation restore it. Missing `rot` means `none`; the default
 channel count remains 32. Both feature channels C and imprint channels K must
-be divisible by four. K remains eight. No dependencies were added.
+be divisible by four in `c4` mode. K remains eight. No dependencies were added.
+The algebra is C4-equivariant; fp32 lock rollouts are **equivariant up to the
+lock estimator's rounding sensitivity**, measured with the one-ulp control below.
 
 ## Action and coordinates
 
-`kwm/rot.py` defines the action used by the model, tests and evaluation. Maps
-have shape `[..., H, W]`: x is the column and y is the row. Vectors use
-`R(dx,dy)=(-dy,dx)`, so a rightward displacement becomes a downward displacement
-on a displayed image. This is a positive mathematical rotation when the y
-axis is drawn upward; with array rows drawn downward it is **`torch.rot90(x,-1)`**.
-The task's simultaneous requirements of this vector matrix and
-`torch.rot90(x,+1)` cannot both hold. The explicit vector matrix and transport
-identity determine the sign here.
+`kwm/rot.py` defines the action used by the model, tests and evaluation.
+In the transport's (x = column, y = row) convention, R(dx,dy) = (−dy, dx),
+equal to `torch.rot90(x, -k, dims=(-2,-1))` on square observation maps for Rᵏ.
+This appears clockwise when rows increase downward; “counter-clockwise”
+assumes a y-up display.
 
 For a 2×2 window (pivot `(0.5,0.5)`), the worked example is:
 
@@ -81,39 +80,46 @@ All ordinary parameter and state arithmetic, including FFTs, remains fp32.
 ## Transport and numerical details
 
 Integer rolls commute with the action bit-for-bit. Fractional streaming needs
-one opt-in numerical change. Legacy rfft2 phase transport gives the Nyquist
-row and column different sign conventions; on a random 50×50 map a quarter
-turn produces about **0.10 normalized error** (a half turn is about 3e-7).
-This is not a convolution-weight issue.
+symmetric Nyquist factors. Legacy rfft2 phase transport gives the Nyquist
+row and column different sign conventions, breaking quarter-turn symmetry
+for fractional displacements on even grids independently of convolution weights.
 
 C4 uses the product of the two one-dimensional Fourier phases, replacing the
 Nyquist phase of **each** even axis with `cos(pi*displacement_axis)`. This is
 real tensor-product trigonometric interpolation and treats x/y symmetrically.
 It is used in feature/LK streaming, lock snapshot transport, dense search
 candidates and frozen-anchor prediction. The default phase implementation is
-untouched. Random fractional-shift comparisons fall to about **3e-7**;
-integer-shift and odd-size tests also pass. Fractional shifts at Nyquist are
-not an invertible representation of continuous translations: successive
+untouched. Fractional-shift, integer-shift and odd-size transport tests pass.
+Fractional shifts at Nyquist are not an invertible representation of continuous translations: successive
 cosine attenuations need not equal one cumulative shift. This limitation
 already exists for real sampled even-grid interpolation.
 
-A second C4-only change raises the invariant denominator floor in
+A second numerical change raises the invariant denominator floor in
 `velocity_weights` from `1e-6` to `1e-2`. Otherwise near-empty blob tails amplify
-fp32 FFT noise into a velocity signal and recurrent feedback can exceed the
-requested output tolerance. This affects weak-memory readout in C4 and is a
+fp32 FFT noise into a velocity signal. This affects weak-memory readout and is a
 deliberate deviation from simply substituting tied convolutions. It introduces
 no direction dependence; `none` keeps its exact original formula. Regression
 cases cover four additional random initializations with weak memory.
 
-One additional C4-only numerical change computes search SSD directly as
+The third numerical change computes search SSD directly as
 `sum_channels((m-current_shifted)**2)`. The legacy norm/dot expansion loses
-significant digits on nearly matching patches. On held-out seed-777 sequence
-22, this changed a later mode decision and produced a 0.064 px/frame node
-offset discrepancy. Direct differences remove that cancellation; candidate
+significant digits on nearly matching patches and can change later mode
+decisions. Direct differences remove that cancellation; candidate
 chunks still bound the temporary allocation (about 23 MB for batch four,
 25 nodes, seven candidates, eight imprint channels and 32×32 windows).
-The standalone estimator harness uses the same C4 arithmetic. `none` retains
+The standalone estimator harness uses the same arithmetic. `none` retains
 its exact norm/dot path. Thresholds, damping and update rules are unchanged.
+
+The internal control `--rot none_c4num` uses plain untied convolution/readout
+layers and the original dense imprint P, together with all three C4 numerical
+changes: symmetric Nyquist factors, the `1e-2` velocity-weight floor, and
+direct-difference SSD. It has the same parameter shapes and initialization as
+`none`; the saved `rot` argument restores the numerical choice on load. The
+internal cell attribute `c4_numerics=False` disables the three changes together
+for the parity test. The tests also compare its readout floor, fractional
+transport, and lock update with C4 on shared constructed features/imprints.
+Use this arm to distinguish tying from numerics in the GPU campaign. The
+absolute `1e-2` floor is scale-dependent, not a learned or universal tolerance.
 
 The central-difference stencil, isotropic 5×5 Gaussian and replicate Gaussian
 padding rotate with the observation square. The LK tensor transforms by
@@ -129,68 +135,141 @@ Random nondegenerate inputs avoid active exact ties. Floating-point changes
 near hard thresholds can still change decisions; this is not a uniform error
 bound over arbitrary trained parameters, horizons or degenerate scenes.
 
-The C4 checkpoint closure captures the prediction update flag for both LK and
-lock, including frozen nodes. The legacy LK behavior remains unchanged under
-`none`, including its pre-existing checkpoint/frozen-node limitation.
+The checkpoint closure captures the prediction update flag for both LK and
+lock in **every rotation mode**, including frozen nodes. This fixes the known
+upstream issue #3: `adaptive` + `lk` + `grad_ckpt` + `node_update_pred off`
+previously recomputed prediction steps with updates enabled during backward.
+This deliberately changes `none` LK gradients only in that experimental
+configuration. The pre-rotation parity test excludes exactly its backward
+comparison while still checking initialization, forward predictions and states;
+a separate test requires checkpointed and ordinary gradients to be bit-identical
+in that configuration for all three rotation modes. Other `none` initialization,
+forward, state and gradient comparisons remain bit-identical.
 
 ## Equivariance evidence
 
-`tests/test_rot.py` uses six observations of three moving blobs, random camera
-actions, four predictions, random model seed 9, C=8, world=50, window=32,
-25 nodes, and relative readout. It tests both adaptive estimators and flowm,
-zero and zero-then-frozen inputs (freeze after two predictions). Memory error
-is the maximum over features, metadata, snapshot/imprint, offsets and node
-velocities, so large accumulated evidence cannot hide a feature error.
-Gradients use relative L2 of the concatenated parameter gradients, plus
-per-tensor `rtol=1e-5, atol=1e-7` comparisons for near-zero derivatives.
-The table takes the worst applicable case across estimators/input policies.
+`tests/test_rot.py` covers all three quarter turns, both adaptive estimators,
+flowm/zero/zero-then-frozen prediction inputs, layer actions, memory fields,
+node relabelling and gradients. The small nondegenerate blob cases retain their
+`1e-5` regression bound; this is not a guarantee for arbitrary lock rollouts.
+Layer tests use `1e-6`. Integer-map permutations, inverse actions and window
+embedding are exact. The boost helper uses the model's numerical transport,
+including symmetric Nyquist factors for `c4` and `none_c4num`.
+The relative-readout boost test uses beta=20 for **both** none and C4:
+at beta=10 finite softmax weight on empty edge nodes makes the `1e-3` bound
+marginal in either mode (none seed 1 also exceeds it).
 
-| Mode | k | Memory | Output | Gradient |
-| --- | ---: | ---: | ---: | ---: |
-| none | 1 | 1.683 | 1.261 | 0.1456 |
-| none | 2 | 1.087 | 1.319 | 0.2240 |
-| none | 3 | 1.683 | 1.276 | 0.2024 |
-| c4 | 1 | 2.67e-7 | 2.01e-7 | 6.71e-7 |
-| c4 | 2 | 2.81e-7 | 2.04e-7 | 5.79e-7 |
-| c4 | 3 | 2.66e-7 | 1.87e-7 | 8.09e-7 |
+The three unchanged pre-rotation source snapshots in `tests/reference` check
+initialization, checkpoint keys, forward states, predictions and gradients
+for `none`, including LK, lock, bf16 autocast and activation checkpointing,
+with prediction updates both on and off. Only the backward configuration
+identified above is excluded. Existing prediction golden tests still apply.
+The unused model `perm_rot` buffer has been removed; `rot_state` computes the
+permutations it actually uses.
 
-Layer tests require normalized error below 1e-6. Integer-map permutations,
-inverse actions and window embedding are exact. The unchanged boost acceptance
-thresholds are also applied to C4 models in `test_galilean.py` and
-`test_lock_nodes.py`. The new C4 relative-readout boost case uses beta=20 to
-suppress finite softmax weight on empty edge nodes (the original none case
-retains beta=10); its 1e-3 acceptance bound is unchanged. Three pre-change source snapshots in `tests/reference`
-check bit-identical initialization, checkpoint keys, forward states, predictions
-and gradients for six `none` configurations, including LK, lock, bf16 autocast
-and activation checkpointing. Existing prediction golden tests still apply.
+### Reading `--rot_check`
 
-`kwm.eval --run RUN --rot_check` reports mean per-sequence normalized L2 as
-`rot_equiv_error` using unclamped fp32 predictions, k=1 and the first 32
-sequences of a held-out validation cache. The seed is `--test_seed`, or 777
-when the main evaluation uses the selection seed. It uses the saved observation
-length and all 150 evaluation prediction steps, and honors prediction overrides.
-The optional `--only_equiv` runs this diagnostic without the main forecast
-metrics and merges its provenance. Output filenames are unchanged.
+`kwm.eval --run RUN --rot_check` checks at most 32 held-out sequences in fp32,
+using unclamped predictions and **k=1,2,3** (`--n_val` can lower the 32-sequence
+budget, and `--bs` can lower the default diagnostic batch size of four).
+For each sequence and horizon h,
+the error is `||expected[:h] - actual[:h]||₂ / max(||expected[:h]||₂, 1e-12)`.
+It reports the mean and maximum over sequences at horizons **1, 4, 20 and the
+full prediction horizon** (150 for normal evaluation). Horizons longer than
+the supplied rollout are omitted and duplicate horizons appear once.
 
-A separate real-MNIST check (32 seed-777 held-out sequences, C=8, model seed 9,
-six observations and four predictions, lock, relative readout, updates on)
-measures **6.88e-7** mean rotation error. Before the direct-difference SSD fix
-it was 7.03e-4, almost entirely from sequence 22. That sequence and its batch
-neighbors are now a fast regression test. Raw short-horizon evidence is in
-`results/pr6_c4/heldout_rotation_short.json`. The diagnostic supports the full
-150-step evaluation horizon; the 32-sequence numerical measurement here uses
-four prediction steps, matching the acceptance horizon.
+The JSON schema is:
 
-An additional 150-step stress test on sequence 22 measures **9.02e-4**, above
-the requested tolerance. This untrained autoregressive model grows beyond
-1e8 around prediction step 95 and reaches roughly 2e13 by step 150; estimator
-roundoff and discrete decisions then amplify the discrepancy. Up to roughly
-90 predicted steps its output error stays around 2–4e-7. Thus the short-horizon
-acceptance criteria pass, but a uniform 1e-5 fp32 guarantee for unstable long
-rollouts has **not** been achieved. The complete 32-sequence, 150-step stress
-run was stopped; the diagnostic itself still evaluates all 150 steps and
-reports the actual discrepancy, including failures. See
-`results/pr6_c4/heldout_rotation_long.json`.
+```text
+rot_equiv_error: {k: {horizon: {mean, max}}}
+ulp_baseline:    {horizon: {mean, max}}
+```
+
+JSON object keys are strings. The baseline uses the same unrotated rollout,
+then advances every observed pixel by one float32 ulp toward +infinity with
+`torch.nextafter(obs.float(), +inf)`. Zeros advance to the smallest positive
+subnormal; camera actions and oracle nodes are unchanged. The metric and
+horizons are identical to the rotation check. Autocast, CUDA matmul TF32 and
+cuDNN TF32 are disabled inside the check; both backend flags are restored,
+including if evaluation raises. The output provenance records these settings.
+
+The held-out seed is `--test_seed`, or 777 when the main evaluation uses the
+selection seed. Saved observation length and prediction overrides are honored.
+`--only_equiv` merges both diagnostic objects and their provenance into an
+existing result. Output filenames are unchanged.
+
+Lock amplifies a one-ulp input perturbation into roughly `1e-5` node-velocity
+changes after one measurement, with later threshold/mode decisions reaching
+`1e-3`–`1e-1`; this also happens with `--rot none`. Rotation reorders fp32
+reductions, so its residual cannot be interpreted below this sensitivity.
+The floor is empirical and scene-dependent, not a universal bound or a proof
+from one chosen perturbation. In particular, a trained C4 lock model at
+150 steps can show rotation error around `1e-3` **with an ulp baseline around
+`1e-3`** and still implement exact C4 equivariance in exact arithmetic.
+
+### Repeated measurements with the ulp control
+
+All measurements below use CPU fp32, no TF32, and report normalized prediction
+error as **mean / maximum over sequences**. Each rotation error is paired with
+its baseline at the same horizon. Raw objects include all three k values and
+all available diagnostic horizons.
+
+Untrained C4 lock, C=8, model seed 9, dataset seed 777: 32 sequences,
+six observations plus four predictions, batch size four. Raw data: [JSON](../results/pr6_c4/heldout_rotation_short.json).
+
+| Horizon | k=1: mean / max | k=2: mean / max | k=3: mean / max | One ulp: mean / max |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 8.877e-07 / 6.489e-06 | 8.191e-07 / 4.380e-06 | 1.058e-06 / 7.942e-06 | 9.162e-07 / 8.999e-06 |
+| 4 | 6.878e-07 / 4.565e-06 | 6.547e-07 / 3.323e-06 | 3.075e-05 / 9.616e-04 | 3.067e-05 / 9.618e-04 |
+
+The same untrained model, sequence 22 of the 32-sequence seed-777 draw:
+six observations plus 150 predictions, batch size one. There is one sequence,
+so each mean equals its maximum. Raw data: [JSON](../results/pr6_c4/heldout_rotation_long.json).
+
+| Horizon | k=1: mean / max | k=2: mean / max | k=3: mean / max | One ulp: mean / max |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 2.273e-06 / 2.273e-06 | 3.923e-06 / 3.923e-06 | 6.304e-06 / 6.304e-06 | 8.995e-06 / 8.995e-06 |
+| 4 | 1.224e-06 / 1.224e-06 | 2.036e-06 / 2.036e-06 | 9.616e-04 / 9.616e-04 | 9.618e-04 / 9.618e-04 |
+| 20 | 3.526e-07 / 3.526e-07 | 2.567e-07 / 2.567e-07 | 4.169e-03 / 4.169e-03 | 4.264e-03 / 4.264e-03 |
+| 150 | 9.020e-04 / 9.020e-04 | 1.947e-02 / 1.947e-02 | 4.203e-02 / 4.203e-02 | 2.394e-02 / 2.394e-02 |
+
+The former 150-step `9.02e-4` figure is superseded by the paired long-horizon
+measurement above. It reflects rounding amplified by lock on an **untrained**
+model. Its extreme output growth occurs for one C=8 initialization (seed 9),
+not C4 seeds 0–3 or C=32 in the review, and is unchanged by reverting the
+Nyquist or floor choices. The trained `pilot_lock` model in the review does not
+show that growth. This is a seed-specific initialization artefact, not evidence of a
+C4-induced long-rollout instability.
+
+Trained `pilot_lock/last.pt` (read-only), step 20,000, C=32, `rot=none`,
+30 observations plus 150 predictions, eight held-out seed-777 sequences,
+batch size four. The full CLI invocation took **1164.16 seconds** on CPU.
+Raw output: [JSON](../results/pr6_c4/eval_pilot_lock_last_rot_check.json). Checkpoint SHA-256:
+`a3bff48fef60981739f68a5651fafad581fb72e3a15007ea4587d9102de406da` (unchanged after evaluation).
+
+| Horizon | k=1: mean / max | k=2: mean / max | k=3: mean / max | One ulp: mean / max |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 1.826e-01 / 2.468e-01 | 1.407e-01 / 2.060e-01 | 1.986e-01 / 2.709e-01 | 5.920e-07 / 8.923e-07 |
+| 4 | 1.866e-01 / 2.529e-01 | 1.495e-01 / 2.031e-01 | 2.010e-01 / 2.626e-01 | 6.336e-07 / 9.860e-07 |
+| 20 | 2.653e-01 / 3.717e-01 | 2.203e-01 / 3.147e-01 | 2.691e-01 / 3.737e-01 | 1.073e-06 / 1.802e-06 |
+| 150 | 5.261e-01 / 5.928e-01 | 4.863e-01 / 5.496e-01 | 4.805e-01 / 6.074e-01 | 3.056e-03 / 1.891e-02 |
+
+Reproduce from this worktree:
+
+```bash
+mkdir -p .pytest_cache/tmp .pytest_cache/xdg .pytest_cache/mpl
+export CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+export PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/.pytest_cache/tmp"
+export XDG_CACHE_HOME="$PWD/.pytest_cache/xdg" MPLCONFIGDIR="$PWD/.pytest_cache/mpl"
+/home/yixunhu/miniconda3/envs/flowm/bin/python -m kwm.eval \
+  --run /home/yixunhu/codespace/kinetic-world-models/runs/pilot_lock \
+  --ckpt last --device cpu --n_val 8 --bs 4 --rot_check --only_equiv \
+  --skip_ft --skip_tp --out results/pr6_c4/ --tag pilot_lock_last_rot_check
+```
+
+The pilot checkpoint is an untied
+`rot=none` model, so its rotation residual is a negative control, not a C4
+acceptance measurement.
 
 ## Parameters and CPU cost
 
@@ -229,57 +308,72 @@ than the spread of individual samples. Raw samples are in
 
 ## No-learning estimator
 
-The existing standalone estimator gate imports cleanly and now accepts `--rot`.
-Seed-0 frozen C=32/K=8 encoders use the first 12 sequences of one seed-2024
-300-sequence draw, 30 observations, exact camera actions and no learning.
+The standalone estimator gate accepts `--rot` and `--encoder-seed`.
+Frozen C=32/K=8 encoders use the first 12 sequences of the **same seed-2024
+300-sequence draw**, 30 observations, exact camera actions and no learning.
 Hungarian matching and last-ten-frame visibility filtering match
-[GATE_estimator.md](GATE_estimator.md); 60 digits are visible.
+[GATE_estimator.md](GATE_estimator.md); 60 digits are visible. Each table entry
+is **matched median (px/frame) / miss rate above 0.1 px/frame**.
 
-| Encoder / transport | Matched median (px/frame) | Misses >0.1 |
+| Encoder seed | none C32 K8: median / miss | c4 C32 K8: median / miss |
 | --- | ---: | ---: |
-| none / legacy | 0.01565608 | 15.0% (9/60) |
-| c4 / symmetric Nyquist / direct SSD | 0.02071618 | 18.33% (11/60) |
-| c4 / symmetric Nyquist / norm-dot SSD, ablation | 0.02071618 | 18.33% (11/60) |
-| c4 / legacy / norm-dot SSD, ablation | 0.02304201 | 16.67% (10/60) |
+| 0 | 0.01566 / 15.0% | 0.02072 / 18.3% |
+| 1 | 0.01695 / 16.7% | 0.01735 / 18.3% |
+| 2 | 0.02086 / 20.0% | 0.02372 / 23.3% |
+| 3 | 0.02151 / 18.3% | 0.01668 / 15.0% |
+| Mean over encoder seeds | 0.01874 / 17.50% | 0.01962 / 18.75% |
 
-The C4 estimator **regresses** by 0.00506010 px/frame (**32.3%**) in matched
-median and 3.33 percentage points (two digits) in miss rate. With the same C4
-encoder and legacy transport/norm-dot SSD, median error is already worse; symmetric Nyquist
-improves that median by 0.00232583 but adds one miss. Thus the changed random
-encoder/projection accounts for the median regression in this draw. There
-are eight independent spatial filters instead of 32 and two independent
-imprint fields instead of eight unrelated projections. These change the random
-metric used for registration. This is evidence about this seed/slice, not a
-causal claim that tying necessarily harms trained or average estimator quality.
-No threshold or encoder seed was tuned to erase the regression. The direct-SSD
-stability fix leaves the matched median and miss rate unchanged on this slice.
+**No regression is demonstrated at this sample size.** The distributions over
+encoder seeds overlap: none spans about 0.0157–0.0215 and C4 0.0167–0.0237.
+The mean difference is about 0.0009 px/frame (5%) and 1.25 percentage points
+in miss rate, within the encoder-seed spread (sample standard deviations
+0.0029 for none and 0.0033 for C4, in px/frame). A single seed-0 comparison
+had selected the best none draw and cannot establish a tying penalty. This 12-sequence slice is **not a
+model-selection tool** for the GPU campaign.
 
-Raw results and per-digit errors are in `results/pr6_c4/estimator_*.json`.
-Reproduce each main row with:
+The review's C=64 and K=32 controls do not change that conclusion. The gate
+only sees the linear map `P · conv_u(frame)`; C4 has K/4 independent spatial
+imprint filters with four rotations each, versus K independent filters in
+none. Increasing C alone leaves that effective imprint diversity unchanged;
+increasing K did not resolve a difference on this slice either. The evidence
+supports random-metric draw-to-draw variance, not an inherent tying regression.
+
+Raw per-digit results are in `results/pr6_c4/estimator_<mode>_seed<s>.json`.
+All eight JSON files are complete and share dataset SHA-256
+`09fafa77ba078b7562bfd2c0851987cd657ba0c4df611ed1949a144ab0b49024`.
+Recorded total runtimes are 35.4–41.5 seconds per run, below the
+ten CPU-minute budget. Reproduce:
 
 ```bash
 export CUDA_VISIBLE_DEVICES='' OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
-python scripts/estimator_gate.py --n 12 --dataset-size 300 --seed 2024 \
-  --batch-size 2 --estimators D_lock_LK_2mode_grid1_heavier_pernode \
-  --skip-benchmark --rot none --out results/pr6_c4/estimator_none.json
-python scripts/estimator_gate.py --n 12 --dataset-size 300 --seed 2024 \
-  --batch-size 2 --estimators D_lock_LK_2mode_grid1_heavier_pernode \
-  --skip-benchmark --rot c4 --out results/pr6_c4/estimator_c4.json
-python scripts/c4_cost.py
+for mode in none c4; do
+  for seed in 0 1 2 3; do
+    python scripts/estimator_gate.py --n 12 --dataset-size 300 --seed 2024 \
+      --encoder-seed "$seed" --batch-size 2 \
+      --estimators D_lock_LK_2mode_grid1_heavier_pernode --skip-benchmark \
+      --rot "$mode" --out "results/pr6_c4/estimator_${mode}_seed${seed}.json"
+  done
+done
 python -m pytest -q
+KWM_SLOW=1 python -m pytest -q
 ```
 
-Validation used `/home/yixunhu/miniconda3/envs/flowm/bin/python` with
-`CUDA_VISIBLE_DEVICES=""`, one OMP/OpenBLAS thread and worktree-local pytest
-temporary files. `KWM_SLOW=1 python -m pytest -q` passed **314 tests in
-304.42 s**, including both dataset regressions. The final standalone
-`tests/test_rot.py` passed **29 tests in 65.90 s**, below the 90 s budget.
-Early development test runs used pytest's default `/tmp` scratch directory;
-the reported final runs use worktree-local temporary directories.
-Both runs emitted the existing `pkg_resources` dependency deprecation warning.
-`git diff --check` is clean. The three reference source files match HEAD
-byte-for-byte. Per-case equivariance measurements are saved in
-`results/pr6_c4/equivariance.json`.
+Fresh continuation validation used
+`/home/yixunhu/miniconda3/envs/flowm/bin/python`, with CUDA hidden and
+OMP/OpenBLAS/MKL limited to one thread. Temporary files, pytest basetemps,
+logs and outputs stayed in this worktree.
+
+| Command | Result | Pytest runtime | Process wall time |
+| --- | --- | ---: | ---: |
+| `python -m pytest -q` | 332 passed, 2 slow tests skipped | 206.85 s | 219.24 s |
+| `KWM_SLOW=1 python -m pytest -q` | 334 passed | 322.32 s | 333.79 s |
+
+Both runs include all three cases in `tests/test_rotation_check.py`, the
+untied-control parity checks, and the checkpoint/ordinary gradient comparisons.
+The two warnings are dependency deprecations (`pkg_resources` and the requested
+PyTorch TF32 flag API). Logs are `.pytest_cache/pr6-continued-default.log` and
+`.pytest_cache/pr6-continued-slow.log`; each invocation used a distinct
+worktree-local `--basetemp`.
 
 ## Scope and limitations
 
@@ -296,5 +390,6 @@ learned walls are not tied, and the experimental ordered wall-bounce processing
 has not been certified under this action. Oracle models accept vector-rotated
 oracle nodes in unchanged object slots; fixed/adaptive lattice models permute
 their slots. New C4 checkpoints cannot load ordinary untied weights as C4
-weights. Defaults preserve tensors and existing metric filenames; checkpoint
+weights. Apart from the explicitly corrected LK checkpoint backward configuration,
+defaults preserve tensors and existing metric filenames; checkpoint
 args necessarily gain `rot`, and source-provenance hashes necessarily change.

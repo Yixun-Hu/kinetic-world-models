@@ -1,5 +1,6 @@
 """CPU C4 acceptance: permutations, transport, tied layers, complete recurrence, training."""
 import importlib.util
+import copy
 import json
 from pathlib import Path
 import sys
@@ -171,19 +172,83 @@ def test_weak_memory_readout(seed):
 
 
 @pytest.mark.parametrize("update", ["lk", "lock"])
-def test_c4_checkpoint_frozen_nodes(update):
+@pytest.mark.parametrize("rot", ["none", "none_c4num", "c4"])
+def test_checkpoint_frozen_nodes(update, rot):
     torch.manual_seed(42)
     obs, ain, aout = torch.rand(1, 3, 1, 8, 8), torch.randn(1, 3, 2), torch.randn(1, 2, 2)
     results = []
     for checkpoint in (False, True):
         torch.manual_seed(43)
-        model = KineticWM(C=4, world=16, window=8, rot="c4", node_update=update,
+        model = KineticWM(C=4, world=16, window=8, rot=rot, node_update=update,
                           node_update_pred=False, grad_ckpt=checkpoint).train()
         pred = model(obs, ain, aout)
         pred.square().mean().backward()
         results.append((pred, [p.grad for p in model.parameters()]))
     assert torch.equal(results[0][0], results[1][0])
     assert all(torch.equal(a, b) for a, b in zip(results[0][1], results[1][1]))
+
+
+@pytest.mark.parametrize("kind,update", [("spectral", "lk"), ("adaptive", "lk"), ("adaptive", "lock")])
+def test_untied_control_with_numerics_disabled(kind, update):
+    """The control changes no weights, RNG draws, forward arithmetic or gradients."""
+    models = []
+    for rot in ("none", "none_c4num"):
+        torch.manual_seed(41)
+        models.append(KineticWM(kind=kind, C=4, world=16, window=8, rot=rot,
+                                node_update=update, readout_rel=True))
+    plain, control = models
+    assert all(torch.equal(v, control.state_dict()[k]) for k, v in plain.state_dict().items())
+    control.cell.c4_numerics = False
+    obs, ain, aout = torch.rand(2, 3, 1, 8, 8), torch.randn(2, 3, 2), torch.randn(2, 2, 2)
+    results = []
+    for model in models:
+        pred = model(obs, ain, aout)
+        pred.square().mean().backward()
+        results.append(pred)
+    assert torch.equal(*results)
+    for p, q in zip(plain.parameters(), control.parameters()):
+        assert torch.equal(p.grad, q.grad)
+    with torch.no_grad():
+        for model in models:
+            model.eval()
+            model.dec_input = "frozen"
+        assert torch.equal(plain(obs, ain, aout), control(obs, ain, aout))
+
+
+@torch.no_grad()
+def test_untied_control_shares_c4_numerics():
+    """Compare the three numerical paths on the same constructed features/imprints."""
+    from kwm.equiv import boost_transform
+    from kwm.lock_nodes import features
+    from kwm.transport import spectral_shift
+    torch.manual_seed(62)
+    control, tied, legacy = [KineticWM(C=4, world=16, window=8, rot=rot, node_update="lock").eval()
+                            for rot in ("none_c4num", "c4", "none")]
+    feat = torch.randn(1, 25, 4, 16, 16) * 1e-3
+    # Weak features expose the denominator floor independently of the encoder.
+    assert torch.equal(control.velocity_weights(feat), tied.velocity_weights(feat))
+    assert not torch.equal(control.velocity_weights(feat), legacy.velocity_weights(feat))
+    h = LockState(feat, torch.rand(1, 25, 4) * .1, torch.rand(1, 8, 8, 8))
+    action = torch.tensor([[.23, -.37]])
+    actual = control.transport_frozen(h, action, 1.5)
+    assert torch.equal(actual.features, tied.transport_frozen(h, action, 1.5).features)
+    assert not torch.equal(actual.features, legacy.transport_frozen(h, action, 1.5).features)
+    for model in (control, tied, legacy):
+        # Fractional boost with round(boost)=0 isolates the helper's transport.
+        shifted = boost_transform(feat, model.nodes(), 1., 4, action, 1, c4=model.c4_numerics)
+        assert torch.equal(shifted, spectral_shift(feat, action, c4=model.c4_numerics))
+
+    # Hold the encoder/mixer/P fixed to isolate lock SSD + snapshot transport;
+    # the C4 reference retains its numerical routing, but uses the same inputs.
+    tied.cell.conv_u = copy.deepcopy(control.cell.conv_u)
+    tied.cell.conv_h = copy.deepcopy(control.cell.conv_h)
+    tied.cell.P.copy_(control.cell.P)
+    obs = torch.rand(1, 1, 8, 8)
+    current = control.cell.imprint(control.cell.conv_u(obs))
+    h = LockState(feat, h.nodes, current + torch.randn_like(current) * 1e-5)
+    outputs = [m.cell(obs, h, action, m.nodes()) for m in (control, tied)]
+    assert all(torch.equal(a, b) for a, b in zip(*outputs))
+    assert torch.isfinite(features(outputs[0])).all()
 
 
 @torch.no_grad()
@@ -217,15 +282,18 @@ def _reference_model():
 
 @pytest.mark.parametrize("kind,update,amp,checkpoint", [
     ("flowm", "lk", False, False), ("spectral", "lk", False, True),
-    ("adaptive", "lk", False, False), ("adaptive", "lock", False, True),
+    ("adaptive", "lk", False, False), ("adaptive", "lk", False, True),
+    ("adaptive", "lock", False, True),
     ("adaptive", "lk", True, True), ("adaptive", "lock", True, True),
 ])
-def test_none_bit_identical(kind, update, amp, checkpoint):
+@pytest.mark.parametrize("update_pred", [True, False])
+def test_none_bit_identical(kind, update, amp, checkpoint, update_pred):
     reference = _reference_model()
     models = []
     for cls in (reference, KineticWM):
         torch.manual_seed(23)
-        models.append(cls(kind=kind, C=4, world=16, window=8, node_update=update, grad_ckpt=checkpoint))
+        models.append(cls(kind=kind, C=4, world=16, window=8, node_update=update,
+                          grad_ckpt=checkpoint, node_update_pred=update_pred))
     old, new = models
     assert old.state_dict().keys() == new.state_dict().keys()
     assert all(torch.equal(v, new.state_dict()[k]) for k, v in old.state_dict().items())
@@ -235,7 +303,12 @@ def test_none_bit_identical(kind, update, amp, checkpoint):
         with torch.autocast("cpu", dtype=torch.bfloat16, enabled=amp):
             pred, aux = model(obs, ain, aout, return_states=[3])
             loss = (pred.float() - .3).square().mean()
-        loss.backward()
+        # Upstream issue #3: legacy LK recomputes frozen prediction steps
+        # with updates enabled. Only that configuration's backward parity is
+        # excluded; its initialization/forward/state parity still applies.
+        legacy_ckpt_bug = kind == "adaptive" and update == "lk" and checkpoint and not update_pred
+        if not legacy_ckpt_bug:
+            loss.backward()
         results.append((pred, aux["states"][3]))
     assert torch.equal(results[0][0], results[1][0])
     if update == "lock" and kind == "adaptive":
@@ -243,7 +316,8 @@ def test_none_bit_identical(kind, update, amp, checkpoint):
     else:
         assert torch.equal(results[0][1], results[1][1])
     for (name, p), (_, q) in zip(old.named_parameters(), new.named_parameters()):
-        assert torch.equal(p.grad, q.grad), name
+        if not legacy_ckpt_bug:
+            assert torch.equal(p.grad, q.grad), name
 
 
 def test_flags_projection_episode_and_eval(tmp_path):
@@ -267,10 +341,23 @@ def test_flags_projection_episode_and_eval(tmp_path):
         u = model.cell.conv_u(obs[:, 0])
         assert normalized_error(model.cell.imprint(rot_regular(u, k)), rot_regular(model.cell.imprint(u), k)).max() < 1e-6
     cache = dict(frames=torch.cat([obs, obs[:, :4]], 1), actions_noisy=torch.cat([ain, aout], 1))
-    assert rotation_check(loaded, cache, 6, "cpu") < 1e-5
+    result = rotation_check(loaded, cache, 6, "cpu")
+    assert set(result["rot_equiv_error"]) == {1, 2, 3}
+    assert set(result["ulp_baseline"]) == {1, 4}
+    assert all(v["max"] < 1e-5 for errors in result["rot_equiv_error"].values() for v in errors.values())
+
+    control_args = dict(args, rot="none_c4num")
+    control = build_model(control_args).eval()
+    torch.save(dict(args=control_args, model=control.state_dict(), step=0), tmp_path / "best.pt")
+    restored, _, _ = load_model(tmp_path, "best", "cpu")
+    assert restored.rot == "none_c4num" and restored.c4_numerics
+    assert isinstance(restored.cell.conv_u, torch.nn.Conv2d)
+    assert parse_args(["--rot", "none_c4num"]).rot == "none_c4num"
+    assert "perm_rot" not in dict(model.named_buffers())
 
 
-def test_eval_rot_check_cli(tmp_path, monkeypatch):
+@pytest.mark.parametrize("n_val", [2, 35])
+def test_eval_rot_check_cli(tmp_path, monkeypatch, n_val):
     import kwm.eval as evaluate
     from kwm.train import parse_args
     torch.manual_seed(24)
@@ -286,11 +373,16 @@ def test_eval_rot_check_cli(tmp_path, monkeypatch):
 
     monkeypatch.setattr(evaluate, "val_cache", cache)
     path = tmp_path / "eval.json"
-    path.write_text(json.dumps(dict(existing_metric=42, rot_equiv_error=99)))
-    evaluate.main(["--run", str(tmp_path), "--out", str(tmp_path), "--n_val", "2", "--device", "cpu",
+    path.write_text(json.dumps(dict(existing_metric=42, rot_equiv_error=99, ulp_baseline=99)))
+    evaluate.main(["--run", str(tmp_path), "--out", str(tmp_path), "--n_val", str(n_val), "--device", "cpu",
                    "--rot_check", "--only_equiv"])
     result = json.loads(path.read_text())
-    assert requests[-1] == (32, 777)
-    assert result["existing_metric"] == 42 and result["rot_equiv_error"] < 1e-5
+    assert requests[-1] == (min(32, n_val), 777)
+    assert result["existing_metric"] == 42
+    assert set(result["rot_equiv_error"]) == {"1", "2", "3"}
+    assert all(v["max"] < 1e-5 for errors in result["rot_equiv_error"].values() for v in errors.values())
+    assert set(result["ulp_baseline"]) == {"1", "2"}
     assert "rot_equiv_error" in result["diagnostic_provenance"]
     assert result["diagnostic_provenance"]["rot_equiv_error"]["sets"]["rot_equiv_error"]["role"] == "heldout"
+    assert result["diagnostic_provenance"]["rot_equiv_error"]["sets"]["rot_equiv_error"]["n"] == min(32, n_val)
+    assert result["diagnostic_provenance"]["ulp_baseline"]["sets"]["ulp_baseline"]["tf32"] is False
