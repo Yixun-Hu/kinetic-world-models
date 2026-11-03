@@ -41,6 +41,8 @@ from .diagnostics import concentration_at, effective_count_at
 from .collision import (lattice_nodes, reflection_perms, bounce_back, rigid_bounce_back,
                         known_wall_field, WallEncoder, VMixing, MLPCollision)
 from .transport import spectral_shift, stream
+from .gconv import GConvRegular, GConvInvariantOut, MomentProjection
+from .rot import rotation_perms
 
 MODELS = ("flowm", "spectral", "adaptive", "oracle")
 COLLISIONS = ("none", "bounce", "vmix", "mlp")
@@ -63,13 +65,16 @@ class KineticWM(nn.Module):
                  bounce="rigid", rigid_K=28, rigid_eps=1e-3, rigid_eps_rel=0.05,
                  dec_input="flowm", beta_init=10.0, grad_ckpt=False,
                  n_digits=5, imprint_k=8, imprint_gamma=0.9,
-                 node_update_pred=True, readout_rel=False, node_update="lk", frozen_k=0):
+                 node_update_pred=True, readout_rel=False, node_update="lk", frozen_k=0, rot="none"):
         super().__init__()
         if kind not in MODELS:
             raise ValueError(f"model must be one of {MODELS}")
         if collision not in COLLISIONS:
             raise ValueError(f"collision must be one of {COLLISIONS}")
         self.kind, self.C, self.world, self.window = kind, C, world, window
+        self.rot = rot
+        if rot == "c4" and collision != "none":
+            raise ValueError("c4 currently requires --collision none")
         self.dec_input, self.grad_ckpt = dec_input, grad_ckpt
         if dec_input not in TRAIN_DEC_INPUTS:
             raise ValueError(f"checkpoint dec_input must be one of {TRAIN_DEC_INPUTS}; frozen modes are eval overrides")
@@ -91,7 +96,7 @@ class KineticWM(nn.Module):
             raise ValueError(bounce)
 
         if kind == "flowm":
-            self.cell = FloWMCell(in_ch, C, world, window, v_range=2)
+            self.cell = FloWMCell(in_ch, C, world, window, v_range=2, rot=rot)
             readout = "max"
             if collision != "none":
                 raise ValueError("flowm is the faithful FloWM replica: no collision")
@@ -111,11 +116,13 @@ class KineticWM(nn.Module):
                 if collision not in ("none", "bounce"):
                     raise ValueError("adaptive supports --collision none or bounce")
                 self.cell = AdaptiveNodeCell(in_ch, C, world, window, num_v=V, spacing=node_spacing,
-                                             imprint_k=imprint_k, gamma=imprint_gamma, node_update=node_update)
+                                             imprint_k=imprint_k, gamma=imprint_gamma, node_update=node_update, rot=rot)
                 self.state_extra = self.cell.extra + self.cell.K_imp if node_update == "lk" else 0
             else:
-                self.cell = KineticCell(in_ch, C, world, window, num_v=V)
+                self.cell = KineticCell(in_ch, C, world, window, num_v=V, rot=rot)
         self.num_v = self.cell.num_v
+        if rot == "c4" and not self.oracle:
+            self.register_buffer("perm_rot", rotation_perms(self.nodes()), persistent=False)
         self._node_traj = None
         self.readout = readout or "moments"
 
@@ -134,9 +141,13 @@ class KineticWM(nn.Module):
 
         if self.readout == "moments":
             self.log_beta = nn.Parameter(torch.tensor(math.log(beta_init)))
-            self.proj = nn.Conv2d(2 * C + 3, C, 1, bias=False)
-        dec = [nn.Conv2d(C, C, 3, padding=1, padding_mode="circular", bias=False), nn.ReLU(),
-               nn.Conv2d(C, 1, 3, padding=1, padding_mode="circular", bias=False)]
+            self.proj = (MomentProjection(C // 4) if rot == "c4" else
+                         nn.Conv2d(2 * C + 3, C, 1, bias=False))
+        if rot == "c4":
+            dec = [GConvRegular(C // 4, C // 4), nn.ReLU(), GConvInvariantOut(C // 4, 1)]
+        else:
+            dec = [nn.Conv2d(C, C, 3, padding=1, padding_mode="circular", bias=False), nn.ReLU(),
+                   nn.Conv2d(C, 1, 3, padding=1, padding_mode="circular", bias=False)]
         self.decoder_conv = nn.Sequential(*dec)
 
     # ------------------------------------------------------------------
@@ -159,7 +170,10 @@ class KineticWM(nn.Module):
     def velocity_weights(self, hw, beta=None):
         """hw [B,V,C,h,w] -> softmax weights over V [B,V,h,w]."""
         e = hw.norm(dim=2)
-        e = e / (e.amax(1, keepdim=True) + 1e-6)
+        # Empty pixels otherwise amplify fp32 FFT roundoff into velocity signal.
+        # C4 keeps this invariant floor above the numerical transport noise.
+        eps = 1e-2 if self.rot == "c4" else 1e-6
+        e = e / (e.amax(1, keepdim=True) + eps)
         if beta is None:
             beta = self.log_beta.exp() if hasattr(self, "log_beta") else 10.0
         return torch.softmax(beta * e, dim=1)
@@ -238,7 +252,7 @@ class KineticWM(nn.Module):
     def step(self, frame, h, a, dt, wall, *, return_prelift=False):
         # Capture the phase before checkpointing: forward() restores the mutable
         # legacy flag before backward recomputes the prediction steps.
-        update = self.cell.update_nodes if self.kind == "adaptive" and self.node_update == "lock" else None
+        update = self.cell.update_nodes if self.kind == "adaptive" and (self.node_update == "lock" or self.rot == "c4") else None
         if self.grad_ckpt and self.training and torch.is_grad_enabled():
             if wall is None:
                 return ckpt.checkpoint(lambda f, hh, aa: self._step(f, hh, aa, dt, None, update, return_prelift),
@@ -256,7 +270,7 @@ class KineticWM(nn.Module):
     def transport_frozen(self, h, cumulative_action, elapsed, activate=False):
         """One spectral shift from the anchor, including carried adaptive velocity."""
         nu = self.node_velocity(h)[..., 0, 0]
-        feat = stream(features(h)[:, :, :self.C], nu, cumulative_action, elapsed)
+        feat = stream(features(h)[:, :, :self.C], nu, cumulative_action, elapsed, c4=self.rot == "c4")
         if activate:
             feat = self.cell.act(feat)
         return self.with_features(h, feat)
@@ -423,4 +437,4 @@ def build_model(args):
                      node_update_pred=(g("node_update_pred", "on") == "on"),
                      node_update=g("node_update", "lk"),
                      readout_rel=(g("readout_rel", "off") == "on"),
-                     grad_ckpt=g("grad_ckpt", False))
+                     grad_ckpt=g("grad_ckpt", False), rot=g("rot", "none"))

@@ -26,7 +26,7 @@ def pad_world(x, world):
     return F.pad(x, (0, world - x.shape[-1], 0, world - x.shape[-2]))
 
 
-def shift_snapshot(snapshot, shifts, world):
+def shift_snapshot(snapshot, shifts, world, *, c4=False):
     """One forward FFT per snapshot, broadcast over node/candidate phases.
 
     snapshot: [B,K,win,win]; shifts: [B,V,2] (or [1,V,2]). The
@@ -34,7 +34,7 @@ def shift_snapshot(snapshot, shifts, world):
     the snapshot and shifts. Phases modify only the materialized node spectra.
     """
     spectrum = torch.fft.rfft2(pad_world(snapshot.float(), world))
-    phase = _phase(world, world, shifts[:, :, None], snapshot.device)
+    phase = _phase(world, world, shifts[:, :, None], snapshot.device, c4=c4)
     # Match the expanded-snapshot FFT's B,K,V,H,freq storage order. Merely
     # broadcasting spectrum during multiplication changes CPU complex-multiply
     # rounding, which discrete mode decisions can amplify across steps.
@@ -154,10 +154,11 @@ class LocalSearch:
     across nodes/lags. Candidate chunks limit transient memory (no image bank).
     """
     @torch.no_grad()
-    def __init__(self, current, world, candidate_chunk=7, radius=1.0):
+    def __init__(self, current, world, candidate_chunk=7, radius=1.0, *, c4=False):
         win = current.shape[-1]
         self.current = current.float()
         self.chunk = candidate_chunk
+        self.c4 = c4
         if radius not in (1.0, 1.5):
             raise ValueError("Search radius must be 1.0 or 1.5 pixels")
         self.radius = radius
@@ -165,7 +166,8 @@ class LocalSearch:
         self.count = self.side**2
         with torch.autocast(device_type=current.device.type, enabled=False):
             self.shifts, self.mask = _candidate_geometry(world, win, radius, current.device)
-            self.shifted = shift_snapshot(self.current, -self.shifts[None], world)[..., :win, :win]
+            shift_args = {"c4": True} if c4 else {}
+            self.shifted = shift_snapshot(self.current, -self.shifts[None], world, **shift_args)[..., :win, :win]
             self.shifted_norm = self.shifted.square().sum(2)
 
     @torch.no_grad()
@@ -181,9 +183,15 @@ class LocalSearch:
             valid = support[:, :, None] * self.mask[:, :, start:stop]
             shifted = self.shifted[:, start:stop]
             # Contract channels directly: never allocate B,V,candidate,C,H,W.
-            dot = torch.einsum("bvchw,bkchw->bvkhw", transported, shifted)
-            ssd = (transported_norm[:, :, None]
-                   + self.shifted_norm[:, None, start:stop] - 2 * dot).clamp_min(0)
+            if self.c4:
+                # Near matching patches, norm + norm - 2*dot cancels most
+                # significant digits. Direct differences keep parabolic search
+                # refinement stable under fp32 rotation/reduction roundoff.
+                ssd = (transported[:, :, None] - shifted[:, None]).square().sum(3)
+            else:
+                dot = torch.einsum("bvchw,bkchw->bvkhw", transported, shifted)
+                ssd = (transported_norm[:, :, None]
+                       + self.shifted_norm[:, None, start:stop] - 2 * dot).clamp_min(0)
             mass = gaussian(valid)
             cost = gaussian(ssd * valid) / mass.clamp_min(1e-6)
             costs.append(cost.masked_fill(mass < 0.5, 1e6))
@@ -212,7 +220,7 @@ class LocalSearch:
 
 
 def lock_measurement(previous, current, nu, lattice, action, world, dt=1.0,
-                     lam_rel=1e-2, tr_rel=0.1, gate=0.6, coh_rel=0.5, bound=0.75):
+                     lam_rel=1e-2, tr_rel=0.1, gate=0.6, coh_rel=0.5, bound=0.75, *, c4=False):
     """Return residual, evidence, and the freshly evaluated lock bit.
 
     LK retains its displacement derivative at locked nodes. Search, all gates,
@@ -222,7 +230,8 @@ def lock_measurement(previous, current, nu, lattice, action, world, dt=1.0,
     with torch.autocast(device_type=current.device.type, enabled=False):
         current, previous, nu = current.float(), previous.float(), nu.float()
         shift = nu * dt - action.float()[:, None]
-        m = shift_snapshot(previous, shift, world)[..., :current.shape[-2], :current.shape[-1]]
+        shift_args = {"c4": True} if c4 else {}
+        m = shift_snapshot(previous, shift, world, **shift_args)[..., :current.shape[-2], :current.shape[-1]]
         lk, trace = lk_displacement(m, current, lam_rel, return_trace=True, per_node_damping=True)
         with torch.no_grad():
             support = shifted_window_mask(shift, world, current.shape[-1])
@@ -231,7 +240,7 @@ def lock_measurement(previous, current, nu, lattice, action, world, dt=1.0,
             textured = m.norm(dim=2) * (trace > tr_rel * trace.mean((2, 3), keepdim=True)) * support
             agreement = le / textured.sum((-2, -1)).clamp_min(1e-6)
             locked = (agreement >= 0.1) & ((ld / dt).norm(dim=-1) <= 0.3)
-            d, usable = LocalSearch(current, world)(m, support)
+            d, usable = LocalSearch(current, world, c4=c4)(m, support)
             d = torch.where(locked[..., None, None, None], lk, d)
             usable = torch.where(locked[..., None, None], True, usable)
             weight = coherence(m, current, trace, d, support * usable, dt, tr_rel, gate, coh_rel)

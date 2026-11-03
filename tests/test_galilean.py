@@ -91,10 +91,11 @@ def test_memory_equivariance_eval_runs():
 
 
 @pytest.mark.parametrize("seed", [0, 1, 2])
-def test_memory_equivariance_comoving_on_lattice_lock(seed):
+@pytest.mark.parametrize("rot", ["none", "c4"])
+def test_memory_equivariance_comoving_on_lattice_lock(seed, rot):
     from kwm.eval import equiv_memory
     torch.manual_seed(seed)
-    args = dict(model="adaptive", C=4, node_spacing=1.0, node_update="lock")
+    args = dict(model="adaptive", C=4, node_spacing=1.0, node_update="lock", rot=rot)
     model = build_model(args).eval()
     out = equiv_memory(model, args, EnvConfig(real_velocity=True, real_camera=True),
                        2, "cpu", ts=(3, 6), chunk=2)
@@ -119,7 +120,8 @@ def test_output_equivariance():
     assert on["comoving_off"]["t5"]["nmse"][0] < 0.75
 
 
-def test_readout_rel_is_galilean_invariant():
+@pytest.mark.parametrize("rot", ["none", "c4"])
+def test_readout_rel_is_galilean_invariant(rot):
     """With content only in interior nodes, a comoving integer boost (relabel nodes by k, action + k) leaves the
     relative-velocity readout -- hence the decoded frame -- unchanged; the absolute readout changes."""
     from kwm.equiv import boost_transform
@@ -128,7 +130,13 @@ def test_readout_rel_is_galilean_invariant():
     diffs = {}
     for rel in (True, False):
         m = build_model(dict(model="spectral", C=4, world=12, window=8, node_spacing=1.0,
-                             readout_rel="on" if rel else "off")).eval()
+                             readout_rel="on" if rel else "off", rot=rot)).eval()
+        if rot == "c4":
+            # Empty edge nodes have nonzero softmax weight at finite beta.
+            # Suppress that finite-lattice bias in the new tied-readout case;
+            # retain the original none case and acceptance bounds unchanged.
+            with torch.no_grad():
+                m.log_beta.fill_(torch.tensor(20.).log())
         h = torch.zeros(1, 25, 4, 12, 12)
         inner = [int(i) for i in range(25) if nodes[i].abs().max() <= 1]
         h[0, inner] = torch.rand(len(inner), 4, 12, 12)

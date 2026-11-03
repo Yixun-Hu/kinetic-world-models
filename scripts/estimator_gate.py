@@ -181,9 +181,10 @@ class LocalSearch:
     across nodes/lags. Candidate chunks limit transient memory (no image bank).
     """
     @torch.no_grad()
-    def __init__(self, current, candidate_chunk=7, radius=1.5):
+    def __init__(self, current, candidate_chunk=7, radius=1.5, *, c4=False):
         self.current = current.float()
         self.chunk = candidate_chunk
+        self.c4 = c4
         if radius not in (1.0, 1.5):
             raise ValueError("Search radius must be 1.0 or 1.5 pixels")
         self.radius = radius
@@ -194,7 +195,7 @@ class LocalSearch:
             yy, xx = torch.meshgrid(axis, axis, indexing="ij")
             self.shifts = torch.stack([xx, yy], -1).reshape(self.count, 2)
             full = pad_world(self.current)[:, None].expand(-1, self.count, -1, -1, -1)
-            self.shifted = spectral_shift(full, -self.shifts[None])[..., :WIN, :WIN]
+            self.shifted = spectral_shift(full, -self.shifts[None], c4=c4)[..., :WIN, :WIN]
             self.shifted_norm = self.shifted.square().sum(2)
             self.mask = shifted_window_mask(-self.shifts)[None, None]
 
@@ -211,9 +212,12 @@ class LocalSearch:
             valid = support[:, :, None] * self.mask[:, :, start:stop]
             shifted = self.shifted[:, start:stop]
             # Contract channels directly: never allocate B,V,candidate,C,H,W.
-            dot = torch.einsum("bvchw,bkchw->bvkhw", transported, shifted)
-            ssd = (transported_norm[:, :, None]
-                   + self.shifted_norm[:, None, start:stop] - 2 * dot).clamp_min(0)
+            if self.c4:
+                ssd = (transported[:, :, None] - shifted[:, None]).square().sum(3)
+            else:
+                dot = torch.einsum("bvchw,bkchw->bvkhw", transported, shifted)
+                ssd = (transported_norm[:, :, None]
+                       + self.shifted_norm[:, None, start:stop] - 2 * dot).clamp_min(0)
             mass = gaussian(valid)
             cost = gaussian(ssd * valid) / mass.clamp_min(1e-6)
             costs.append(cost.masked_fill(mass < 0.5, 1e6))
@@ -384,8 +388,9 @@ SPECS += [Spec("D_lock_LK_2mode_grid1_heavier_pernode", "D", modes=True,
 
 
 class Estimator:
-    def __init__(self, spec, batch, device):
+    def __init__(self, spec, batch, device, *, c4=False):
         self.spec = spec
+        self.c4 = c4
         self.lattice = lattice_nodes().to(device)
         self.nu = self.lattice[None].expand(batch, -1, -1).clone()
         self.evidence = torch.zeros(batch, NODES, device=device)
@@ -405,11 +410,11 @@ class Estimator:
         m = pad_world(self.history[0][0])[:, None].expand(-1, NODES, -1, -1, -1).clone()
         previous_camera = self.history[0][1]
         for j, (imprint, camera) in enumerate(list(self.history)[1:], 1):
-            m = spectral_shift(m, self.node_history[j - 1] - (camera - previous_camera)[:, None])
+            m = spectral_shift(m, self.node_history[j - 1] - (camera - previous_camera)[:, None], c4=self.c4)
             m *= 0.9
             m[..., :WIN, :WIN] = imprint[:, None]
             previous_camera = camera
-        m = spectral_shift(m, self.nu - action[:, None])
+        m = spectral_shift(m, self.nu - action[:, None], c4=self.c4)
         return m[..., :WIN, :WIN]
 
     def update(self, delta, evidence):
@@ -460,7 +465,7 @@ class Estimator:
             # variants retain cumulative subtraction for reproducibility.
             camera_delta = action if spec.per_node else self.cumulative_camera - camera
             shift = self.nu * lag - camera_delta[:, None]
-            m = spectral_shift(pad_world(old)[:, None].expand(-1, NODES, -1, -1, -1), shift)[..., :WIN, :WIN]
+            m = spectral_shift(pad_world(old)[:, None].expand(-1, NODES, -1, -1, -1), shift, c4=self.c4)[..., :WIN, :WIN]
             support = shifted_window_mask(shift)
             if spec.family in ("D", "S"):
                 lk, trace = lk_displacement(m, current, return_trace=True, per_node_damping=spec.per_node)
@@ -479,7 +484,7 @@ class Estimator:
                 trace = texture_trace(m)
                 locked = None
             if search is None:
-                search = LocalSearch(current, radius=spec.search_radius)
+                search = LocalSearch(current, radius=spec.search_radius, c4=self.c4)
             d, usable = search(m, support)
             if locked is not None:
                 # Dense evaluation and tensor selection avoid dynamic indexing
@@ -577,7 +582,7 @@ def run_estimator(spec, frames, actions, cell, batch_size, device, max_seconds=N
     peak = 0
     for first in range(0, len(frames), batch_size):
         f, a = frames[first:first + batch_size].to(device), actions[first:first + batch_size].to(device)
-        estimator = Estimator(spec, len(f), device)
+        estimator = Estimator(spec, len(f), device, c4=cell.rot == "c4")
         trajectory = []
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
@@ -610,7 +615,7 @@ def benchmark(spec, frames, actions, cell, device, repeats):
     """
     indices = torch.arange(16) % len(frames)
     f, a = frames[indices].to(device), actions[indices].to(device)
-    estimator = Estimator(spec, 16, device)
+    estimator = Estimator(spec, 16, device, c4=cell.rot == "c4")
     samples = []
     for t in range(9 + repeats):
         sync(device)
@@ -635,7 +640,7 @@ def benchmark_costs(frames, actions, cell, repeats=11):
     specs = [s for s in SPECS if s.family == "S" or (s.family == "D" and s.modes)]
     result = {}
     for spec in [None] + specs:
-        estimator = None if spec is None else Estimator(spec, 16, torch.device("cpu"))
+        estimator = None if spec is None else Estimator(spec, 16, torch.device("cpu"), c4=cell.rot == "c4")
         samples = []
         for t in range(9 + repeats):
             start = time.perf_counter()
@@ -865,7 +870,7 @@ def self_check(cell):
                        gen=torch.Generator().manual_seed(93), split="test")
     f, a = batch["frames"].to(device), batch["actions"].to(device)
     for spec in SPECS[:2]:
-        estimator = Estimator(spec, 2, device)
+        estimator = Estimator(spec, 2, device, c4=cell.rot == "c4")
         cell.step_clip = 0.3 if spec.step_clip is not None else math.inf
         h = torch.zeros(2, 25, 43, WORLD, WORLD, device=device)
         for t in range(6):
@@ -946,6 +951,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--n", type=int, default=300)
     parser.add_argument("--seed", type=int, default=2024)
+    parser.add_argument("--rot", choices=("none", "c4"), default="none", help="random encoder and transport symmetry")
     parser.add_argument("--dataset-size", type=int, help="generate this many sequences before slicing")
     parser.add_argument("--start-index", type=int, default=0, help="first sequence in the generated dataset")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
@@ -966,6 +972,8 @@ def main():
     parser.add_argument("--prediction-seed", type=int, default=778)
     parser.add_argument("--prediction-cache", type=Path)
     args = parser.parse_args()
+    if args.rot == "c4" and args.parity_reference:
+        parser.error("historical parity references use legacy transport; use --rot none")
     if args.pool_results:
         result = pool_results(args.pool_results)
         save_result(args.out, result)
@@ -1000,7 +1008,7 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     torch.manual_seed(0)
-    cell = AdaptiveNodeCell(C=32, num_v=25).eval().to(device)
+    cell = AdaptiveNodeCell(C=32, num_v=25, rot=args.rot).eval().to(device)
     for parameter in cell.parameters():
         parameter.requires_grad_(False)
     start = time.perf_counter()

@@ -280,6 +280,26 @@ def node_velocity_error(model, cache, T_obs, device, n=64, bs=16):
     return {"median": float(t.median()), "mean": float(t.mean()), "n": len(errs)}
 
 
+@torch.no_grad()
+def rotation_check(model, cache, T_obs, device, n=32, bs=4):
+    """Unclamped fp32 predictions on held-out episodes and their quarter turns."""
+    from .rot import rot_episode, rot_map, rot_nodes, normalized_error
+    if model.collision_kind != "none":
+        raise ValueError("rot_check currently requires --collision none")
+    errors = []
+    for start in range(0, min(n, len(cache["frames"])), bs):
+        frames = cache["frames"][start:start + min(bs, n - start)].float().to(device)
+        actions = cache["actions_noisy"][start:start + len(frames)].float().to(device)
+        obs, ain, aout = frames[:, :T_obs], actions[:, :T_obs], actions[:, T_obs:]
+        robs, rain, raout, _ = rot_episode(obs, ain, aout, k=1)
+        nodes = oracle_nodes_from(cache["vel"][start:start + len(frames), 0].to(device)) if model.oracle else None
+        with torch.autocast(device_type=device.split(":")[0], enabled=False):
+            pred = model(obs, ain, aout, nodes=nodes)
+            rotated = model(robs, rain, raout, nodes=None if nodes is None else rot_nodes(nodes))
+        errors.append(normalized_error(rot_map(pred, window=model.window), rotated).cpu())
+    return torch.cat(errors).mean().item()
+
+
 def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--run", required=True)
@@ -313,6 +333,7 @@ def main(argv=None):
                    help="zero_then_frozen only: run N zero-input prediction steps, then freeze (default 20; N>=0)")
     # boost equivariance (on / off the velocity lattice)
     p.add_argument("--equiv_boost", action="store_true", help="boost equivariance of the memory (t=10,30) and of the predictions (t=10,20)")
+    p.add_argument("--rot_check", action="store_true", help="fp32 C4 sanity check on 32 held-out sequences")
     p.add_argument("--n_equiv", type=int, default=48)
     p.add_argument("--only_equiv", action="store_true",
                    help="skip everything but the equivariance tests; the result is MERGED into an existing eval<tag>.json")
@@ -357,6 +378,15 @@ def main(argv=None):
     role = "selection" if test_seed == VAL_SEED else "heldout"
     cache_set = dict(seed=test_seed, mnist_split="test", role=role, n=n_val, t_obs=T_obs, t_pred=T_pred, chunk=50)
 
+    if a.rot_check:
+        # Always held out from selection, even when the main eval uses VAL_SEED.
+        rotation_seed = test_seed if test_seed != VAL_SEED else 777
+        rotation_cache = val_cache(cfg, 32, T_obs=T_obs, device=device, seed=rotation_seed)
+        res["rot_equiv_error"] = rotation_check(model, rotation_cache, T_obs, device)
+        res["sets"]["rot_equiv_error"] = dict(seed=rotation_seed, mnist_split="test", role="heldout",
+                                               n=32, k=1, t_obs=T_obs, t_pred=T_pred, amp=False)
+        print("[rot_equiv_error]", res["rot_equiv_error"])
+
     # ---------------- adaptive: node velocity error at the end of the observation ----------------
     if args["model"] == "adaptive" and not cfg.walls:
         res["sets"]["node_velocity_error"] = dict(cache_set, n=min(64, n_val))
@@ -366,7 +396,7 @@ def main(argv=None):
         print("[node_velocity_error]", ne)
 
     # ---------------- boost equivariance of the memory / of the predictions ----------------
-    if a.equiv_boost or (a.only_equiv and not a.equiv_boost_output):
+    if a.equiv_boost or (a.only_equiv and not a.equiv_boost_output and not a.rot_check):
         res["sets"]["equiv"] = dict(seed=777, mnist_split="test", role="heldout", n=a.n_equiv, chunk=16,
                                      sequence_seed="seed * 1000 + chunk_start")
         res["equiv"] = equiv_memory(model, args, cfg, a.n_equiv, device)
@@ -382,11 +412,11 @@ def main(argv=None):
     if a.only_equiv:
         path = os.path.join(out_dir, f"eval{sfx}.json")
         old = json.load(open(path)) if os.path.exists(path) else {}
-        old.update({k: v for k, v in res.items() if k in ("equiv", "equiv_output")})
+        old.update({k: v for k, v in res.items() if k in ("equiv", "equiv_output", "rot_equiv_error")})
         # A merged file may contain metrics from an earlier invocation. Keep their
         # provenance, and identify the invocation that produced each new diagnostic.
         diagnostic_keys = ("provenance", "ckpt_provenance", "seed", "test_seed", "sets")
-        for key in ("equiv", "equiv_output"):
+        for key in ("equiv", "equiv_output", "rot_equiv_error"):
             if key in res:
                 old.setdefault("diagnostic_provenance", {})[key] = dict(
                     {k: res[k] for k in diagnostic_keys}, ckpt=a.ckpt, step=step)

@@ -1,0 +1,11 @@
+{
+  "n": 32,
+  "seed": 777,
+  "C": 8,
+  "model_seed": 9,
+  "node_update": "lock",
+  "observation_steps": 6,
+  "prediction_steps": 4,
+  "rot_equiv_error": 6.878165095258737e-07,
+  "seconds": 74.30487445741892
+}

@@ -10,17 +10,25 @@ import math
 import torch
 
 
-def _phase(H, W, shift, device):
+def _phase(H, W, shift, device, *, c4=False):
     """Complex phase exp(-2*pi*i*(kx*dx + ky*dy)) of shape shift.shape[:-1] + (H, W//2+1)."""
     ky = torch.fft.fftfreq(H, device=device, dtype=torch.float32)          # [H]
     kx = torch.fft.rfftfreq(W, device=device, dtype=torch.float32)         # [W//2+1]
     dx = shift[..., 0, None, None].float()
     dy = shift[..., 1, None, None].float()
+    if c4:
+        # Real tensor-product interpolation at both Nyquist axes. The legacy
+        # one-sided rfft phase couples their signs and breaks quarter turns.
+        ax, ay = -2 * math.pi * kx[None, :] * dx, -2 * math.pi * ky[:, None] * dy
+        px, py = torch.polar(torch.ones_like(ax), ax), torch.polar(torch.ones_like(ay), ay)
+        px = torch.where(kx[None, :] == 0.5, torch.cos(math.pi * dx).to(px.dtype), px)
+        py = torch.where(ky[:, None] == -0.5, torch.cos(math.pi * dy).to(py.dtype), py)
+        return px * py
     ang = -2 * math.pi * (kx[None, :] * dx + ky[:, None] * dy)            # [..., H, W//2+1]
     return torch.polar(torch.ones_like(ang), ang)
 
 
-def spectral_shift(h, shift_xy):
+def spectral_shift(h, shift_xy, *, c4=False):
     """Shift real periodic maps by real displacements via an rfft2 phase ramp.
 
     h:        [..., H, W] real
@@ -29,6 +37,8 @@ def spectral_shift(h, shift_xy):
               (one shift per batch), [B,V,2] (per batch and velocity node) or
               [V,2] / [2]. Missing trailing dims of h are filled with 1s.
     Differentiable w.r.t. both h and shift_xy. Computed in float32 and cast back.
+    c4=True uses real cosine factors at both Nyquist axes for quarter-turn
+    symmetry; False retains the original rfft phase convention bit-for-bit.
     """
     H, W = h.shape[-2:]
     lead = h.shape[:-2]
@@ -38,7 +48,7 @@ def spectral_shift(h, shift_xy):
     # left-align: s [B,2] vs lead (B,V,C) -> view s as [B,1,1,2]
     while s.dim() - 1 < len(lead):
         s = s.unsqueeze(-2)
-    ph = _phase(H, W, s, h.device)                                         # [b..., H, W//2+1]
+    ph = _phase(H, W, s, h.device, c4=c4)                                  # [b..., H, W//2+1]
     Hf = torch.fft.rfft2(h if h.dtype == torch.float32 else h.float())
     if ph.requires_grad:                       # learnable nodes: keep Hf for d/d(shift)
         Hf = Hf * ph
@@ -48,7 +58,7 @@ def spectral_shift(h, shift_xy):
     return out.to(h.dtype)
 
 
-def stream(h, nodes, a, dt=1.0):
+def stream(h, nodes, a, dt=1.0, *, c4=False):
     """Kinetic streaming + ego-motion in one phase multiplication.
 
     h:     [B, V, C, H, W] memory in ego coordinates; channel group i holds the
@@ -62,7 +72,7 @@ def stream(h, nodes, a, dt=1.0):
     if nodes.dim() == 2:
         nodes = nodes[None]
     disp = nodes * dt - a[:, None, :]                                      # [B, V, 2]
-    return spectral_shift(h, disp)
+    return spectral_shift(h, disp, c4=c4)
 
 
 def phase_correlation(x, y, reg=1e-3, newton_iters=10):

@@ -278,8 +278,9 @@ def test_state_replay_and_prediction_freeze():
 
 
 @pytest.mark.parametrize('boost', [(1., 0.), (-1., 1.)])
+@pytest.mark.parametrize('rot', ['none', 'c4'])
 @torch.no_grad()
-def test_on_lattice_boost(boost):
+def test_on_lattice_boost(boost, rot):
     # Same H, T, blob centres, velocities and boosts as test_galilean's
     # synthetic transport test; exercise observation-driven node updates too.
     H, T = 48, 10
@@ -287,15 +288,16 @@ def test_on_lattice_boost(boost):
     errors = {}
     for mode in ('lk', 'lock'):
         torch.manual_seed(0)
-        cell = AdaptiveNodeCell(C=2, world=H, window=H, node_update=mode)
+        C = 4 if rot == 'c4' else 2
+        cell = AdaptiveNodeCell(C=C, world=H, window=H, node_update=mode, rot=rot)
         state = cell.initial_state(torch.zeros(1, 1, H, H))
         boosted = cell.initial_state(torch.zeros(1, 1, H, H))
         for t in range(T):
             frame = (_blob(H, 20 + t, 20) + _blob(H, 30, 12 - t))[None, None]
             state = cell(frame, state, torch.zeros(1, 2), nodes)
             boosted = cell(frame, boosted, u if t else torch.zeros_like(u), nodes)
-        transformed, mask = boost_transform_nodes(state, nodes, 1., 2, u, .75)
-        errors[mode] = equiv_error(transformed, boosted, 2, mask & interior_mask(nodes, 1.)).item()
+        transformed, mask = boost_transform_nodes(state, nodes, 1., C, u, .75)
+        errors[mode] = equiv_error(transformed, boosted, C, mask & interior_mask(nodes, 1.)).item()
     print(f'on-lattice feature equivariance {boost}: {errors}')
     assert errors['lock'] < 1e-6
     assert errors['lk'] < 1e-6

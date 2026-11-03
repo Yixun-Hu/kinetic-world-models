@@ -15,6 +15,7 @@ import torch.nn as nn
 
 from .transport import stream, lk_displacement
 from .lock_nodes import LockState, lock_measurement
+from .gconv import GConvLift, GConvRegular
 
 
 def _fixed_projection(C, K, seed=1234):
@@ -38,11 +39,18 @@ def int_roll_batch(h, shift):
 
 
 class _Base(nn.Module):
-    def __init__(self, in_ch, C, world, window):
+    def __init__(self, in_ch, C, world, window, rot="none"):
         super().__init__()
         self.C, self.world, self.window = C, world, window
-        self.conv_u = nn.Conv2d(in_ch, C, 3, padding=1, padding_mode="circular", bias=False)
-        self.conv_h = nn.Conv2d(C, C, 3, padding=1, padding_mode="circular", bias=False)
+        if rot not in ("none", "c4") or (rot == "c4" and C % 4):
+            raise ValueError("rot must be none or c4; c4 requires C divisible by 4")
+        self.rot = rot
+        if rot == "c4":
+            self.conv_u = GConvLift(in_ch, C // 4)
+            self.conv_h = GConvRegular(C // 4, C // 4)
+        else:
+            self.conv_u = nn.Conv2d(in_ch, C, 3, padding=1, padding_mode="circular", bias=False)
+            self.conv_h = nn.Conv2d(C, C, 3, padding=1, padding_mode="circular", bias=False)
         self.act = nn.ReLU()
 
     def lift(self, u_t, V):
@@ -68,8 +76,8 @@ class _Base(nn.Module):
 
 
 class FloWMCell(_Base):
-    def __init__(self, in_ch=1, C=64, world=50, window=32, v_range=2):
-        super().__init__(in_ch, C, world, window)
+    def __init__(self, in_ch=1, C=64, world=50, window=32, v_range=2, rot="none"):
+        super().__init__(in_ch, C, world, window, rot)
         # identical ordering to FloWM: vx outer, vy inner
         self.v_list = [(vx, vy) for vx in range(-v_range, v_range + 1) for vy in range(-v_range, v_range + 1)]
         self.num_v = len(self.v_list)
@@ -87,8 +95,8 @@ class FloWMCell(_Base):
 class KineticCell(_Base):
     """forward(u_t, h_prev, action, nodes [V,2] or [B,V,2], dt, collision(h) -> h or None)."""
 
-    def __init__(self, in_ch=1, C=64, world=50, window=32, num_v=25):
-        super().__init__(in_ch, C, world, window)
+    def __init__(self, in_ch=1, C=64, world=50, window=32, num_v=25, rot="none"):
+        super().__init__(in_ch, C, world, window, rot)
         self.num_v = num_v
 
     def forward(self, u_t, h_prev, action, nodes, dt=1.0, collision=None, *, update_nodes=None,
@@ -96,7 +104,7 @@ class KineticCell(_Base):
         # Common kinetic-cell interface; this cell's nodes are always fixed.
         if collision is not None:
             h_prev = collision(h_prev)
-        hs = stream(h_prev, nodes, action, dt)                               # spectral, exact
+        hs = stream(h_prev, nodes, action, dt, c4=self.rot == "c4")
         return self.feature_update(u_t, hs, return_prelift)
 
 
@@ -128,13 +136,20 @@ class AdaptiveNodeCell(_Base):
 
     def __init__(self, in_ch=1, C=64, world=50, window=32, num_v=25, spacing=1.0, imprint_k=8, gamma=0.9,
                  lam_rel=1e-2, tr_rel=0.1, gate=0.6, bound=0.75, coh_rel=0.5, step_clip=0.3, s_init=1.0,
-                 node_update="lk"):
-        super().__init__(in_ch, C, world, window)
+                 node_update="lk", rot="none"):
+        super().__init__(in_ch, C, world, window, rot)
         self.num_v, self.half, self.K_imp = num_v, spacing / 2, imprint_k
         self.gamma, self.lam_rel, self.tr_rel, self.gate = gamma, lam_rel, tr_rel, gate
         self.bound, self.coh_rel, self.step_clip = bound, coh_rel, step_clip
         self.n_s = nn.Parameter(torch.tensor(float(s_init)))
-        self.register_buffer("P", _fixed_projection(C, imprint_k))               # fixed, not trained
+        if rot == "c4":
+            if imprint_k % 4:
+                raise ValueError("c4 requires imprint_k divisible by 4")
+            projection = torch.einsum("kf,rs->krfs", _fixed_projection(C // 4, imprint_k // 4),
+                                      torch.eye(4)).reshape(imprint_k, C)
+        else:
+            projection = _fixed_projection(C, imprint_k)
+        self.register_buffer("P", projection)                                  # fixed, not trained
         self.last_nodes = None
         self.update_nodes = True
         if node_update not in ("lk", "lock"):
@@ -205,7 +220,7 @@ class AdaptiveNodeCell(_Base):
             h_prev = collision(h_prev)
         rho = self.offsets(h_prev)
         nu = nodes[None].float() + rho                                              # [B,V,2]
-        hs = stream(h_prev, nu, action, dt)                                         # exact, per-sample nodes
+        hs = stream(h_prev, nu, action, dt, c4=self.rot == "c4")
         feat, m = hs[:, :, :C], hs[:, :, C + E:]
         win = u_t.shape[-1]
         u = self.conv_u(u_t)
@@ -246,14 +261,14 @@ class AdaptiveNodeCell(_Base):
         rho = self.offsets(h_prev)
         with torch.autocast(device_type=u_t.device.type, enabled=False):
             nu = nodes[None].float() + rho
-            feat = stream(h_prev.features, nu, action.float(), dt)
+            feat = stream(h_prev.features, nu, action.float(), dt, c4=self.rot == "c4")
         if update_nodes:
             u = self.conv_u(u_t)
             with torch.autocast(device_type=u_t.device.type, enabled=False):
                 pu = self.imprint(u.float())
                 delta, evidence, locked = lock_measurement(
                     h_prev.snapshot, pu, nu, nodes, action, self.world, dt,
-                    self.lam_rel, self.tr_rel, self.gate, self.coh_rel, self.bound)
+                    self.lam_rel, self.tr_rel, self.gate, self.coh_rel, self.bound, c4=self.rot == "c4")
                 W_new = h_prev.nodes[..., 2:3] + evidence[..., None]
                 gain = evidence[..., None] / W_new.clamp_min(1e-6)
                 # Form the residual from the measured velocity in fp32.

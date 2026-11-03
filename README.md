@@ -33,6 +33,10 @@ their true positions while they are out of view.*
   fractional-time prediction, and equivariance under real-valued boosts.
 - The scripts and figures behind `docs/RESULTS.md`.
 
+`python -m kwm.train --rot c4` enables C4 rotation equivariance (`C % 4 == 0`;
+default `--rot none` is unchanged). `python -m kwm.eval --run RUN --rot_check`
+checks 32 held-out rotated episodes. See [PR6: C4 rotation](docs/PR6_c4_rotation.md).
+
 ## Main result
 
 Mean squared error of the predicted viewport on 300 validation sequences with
