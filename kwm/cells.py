@@ -138,7 +138,7 @@ class AdaptiveNodeCell(_Base):
 
     def __init__(self, in_ch=1, C=64, world=50, window=32, num_v=25, spacing=1.0, imprint_k=8, gamma=0.9,
                  lam_rel=1e-2, tr_rel=0.1, gate=0.6, bound=0.75, coh_rel=0.5, step_clip=0.3, s_init=1.0,
-                 node_update="lk", rot="none"):
+                 node_update="lk", rot="none", pin_static=False):
         super().__init__(in_ch, C, world, window, rot)
         self.num_v, self.half, self.K_imp = num_v, spacing / 2, imprint_k
         self.gamma, self.lam_rel, self.tr_rel, self.gate = gamma, lam_rel, tr_rel, gate
@@ -157,6 +157,14 @@ class AdaptiveNodeCell(_Base):
         if node_update not in ("lk", "lock"):
             raise ValueError("node_update must be lk or lock")
         self.node_update = node_update
+        self.pin_static = pin_static
+
+    def _pin(self, value, nodes):
+        """Zero static velocity metadata/evidence without altering its features."""
+        if not self.pin_static:
+            return value
+        static = (nodes == 0).all(-1)[None]
+        return value.masked_fill(static.reshape(*static.shape, *([1] * (value.ndim - 2))), 0)
 
     def initial_state(self, observation):
         B = observation.shape[0]
@@ -220,7 +228,7 @@ class AdaptiveNodeCell(_Base):
         C, K, E = self.C, self.K_imp, self.extra
         if collision is not None:                       # wall bounce on the adaptive nodes
             h_prev = collision(h_prev)
-        rho = self.offsets(h_prev)
+        rho = self._pin(self.offsets(h_prev), nodes)
         nu = nodes[None].float() + rho                                              # [B,V,2]
         hs = stream(h_prev, nu, action, dt, c4=self.c4_numerics)
         feat, m = hs[:, :, :C], hs[:, :, C + E:]
@@ -238,13 +246,14 @@ class AdaptiveNodeCell(_Base):
             w = w * torch.exp(-mis / sig[:, None, None, None] ** 2)
         if not update_nodes:
             w = torch.zeros_like(w)       # no evidence from the model's own predictions: rho, W frozen
+        w = self._pin(w, nodes)
         wsum = w.sum((-2, -1))                                                      # [B,V] evidence this step
         delta = (w[:, :, None] * d).sum((-2, -1)) / (wsum[:, :, None] + 1e-6)     # [B,V,2]
         Wc = h_prev[:, :, C + 2:C + 3].float().mean((-2, -1))                      # [B,V,1] cumulative evidence
-        W_new = Wc + wsum[..., None]
+        W_new = self._pin(Wc + wsum[..., None], nodes)
         gain = wsum[..., None] / W_new.clamp_min(1e-6)                              # running-mean gain
         step = (self.n_s * gain * delta / dt).clamp(-self.step_clip, self.step_clip)
-        rho_new = (rho + step).clamp(-self.bound, self.bound)
+        rho_new = self._pin((rho + step).clamp(-self.bound, self.bound), nodes)
         self.last_nodes = (nodes[None].float() + rho_new).detach()
         updated = self.feature_update(u_t, feat, return_prelift)
         h_new = updated[0] if return_prelift else updated
@@ -260,7 +269,7 @@ class AdaptiveNodeCell(_Base):
     def _forward_lock(self, u_t, h_prev, action, nodes, dt, collision, update_nodes, return_prelift=False):
         if collision is not None:
             h_prev = collision(h_prev)
-        rho = self.offsets(h_prev)
+        rho = self._pin(self.offsets(h_prev), nodes)
         with torch.autocast(device_type=u_t.device.type, enabled=False):
             nu = nodes[None].float() + rho
             feat = stream(h_prev.features, nu, action.float(), dt, c4=self.c4_numerics)
@@ -271,6 +280,7 @@ class AdaptiveNodeCell(_Base):
                 delta, evidence, locked = lock_measurement(
                     h_prev.snapshot, pu, nu, nodes, action, self.world, dt,
                     self.lam_rel, self.tr_rel, self.gate, self.coh_rel, self.bound, c4=self.c4_numerics)
+                evidence = self._pin(evidence, nodes)
                 W_new = h_prev.nodes[..., 2:3] + evidence[..., None]
                 gain = evidence[..., None] / W_new.clamp_min(1e-6)
                 # Form the residual from the measured velocity in fp32.
@@ -280,6 +290,7 @@ class AdaptiveNodeCell(_Base):
                 state = torch.cat([rho_new, W_new, locked[..., None]], -1)
         else:
             state, pu = h_prev.nodes, h_prev.snapshot
+        state = self._pin(state, nodes)
         # Use the existing feature recurrence, independent of estimator state.
         updated = self.feature_update(u_t, feat, return_prelift)
         h_new = updated[0] if return_prelift else updated

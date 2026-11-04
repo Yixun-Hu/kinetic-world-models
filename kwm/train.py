@@ -150,6 +150,10 @@ def get_parser():
     g.add_argument("--rot", choices=["none", "c4", "none_c4num"], default="none",
                    help="C4 rotation equivariance (requires C %% 4 == 0); none_c4num is an internal untied numerical control")
     g.add_argument("--node_spacing", type=float, default=1.0, help="velocity lattice spacing (1.0: 25 nodes)")
+    g.add_argument("--lattice", choices=["grid", "v5", "v9", "v17"], default="grid",
+                   help="velocity node set; grid preserves node_spacing and legacy ordering")
+    g.add_argument("--pin_static", nargs="?", const="on", choices=["on", "off"], default=None,
+                   help="freeze zero-node metadata (default: off for grid, on for named sets)")
     g.add_argument("--readout", default=None, choices=[None, "max", "moments"],
                    help="default: max for flowm, moments otherwise")
     g.add_argument("--readout_rel", default="off", choices=["on", "off"],
@@ -209,7 +213,9 @@ def parse_args(argv=None):
     pre, _ = p.parse_known_args(argv)
     if pre.preset:
         p.set_defaults(**PRESETS[pre.preset])
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    args.pin_static = args.lattice != "grid" if args.pin_static is None else args.pin_static == "on"
+    return args
 
 
 def main(argv=None):

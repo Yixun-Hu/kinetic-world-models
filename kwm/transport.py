@@ -119,7 +119,7 @@ def _gauss5(sigma=1.0, device="cpu"):
 
 
 def lk_displacement(h, u, lam_rel=1e-2, sigma=1.0, eps=1e-3, max_disp=1.0, return_trace=False,
-                    *, per_node_damping=False):
+                    *, per_node_damping=False, support_mask=None):
     """One-step Lucas-Kanade estimate of the extra per-step displacement of transported content.
 
     h: [B, V, C, h, w] transported maps on the observed window (the adaptive-node model uses its observation
@@ -132,13 +132,31 @@ def lk_displacement(h, u, lam_rel=1e-2, sigma=1.0, eps=1e-3, max_disp=1.0, retur
     Differentiable (closed-form 2x2 inverse); always computed in float32 (autocast disabled: G in bf16 cancels).
     With per_node_damping=True, the reference trace averages pixels separately
     for each node, so a node's damping is independent of other lattice nodes.
+    Optional support_mask broadcasts to [B,V,H,W]. Its one-pixel erosion
+    excludes central differences across any unobserved boundary (including
+    the box edge); Gaussian terms and damping means use only that support.
     """
     with torch.autocast(device_type=h.device.type, enabled=False):
-        d, tr2 = _lk_fp32(h.float(), u.float(), lam_rel, sigma, eps, max_disp, per_node_damping)
+        d, tr2 = _lk_fp32(h.float(), u.float(), lam_rel, sigma, eps, max_disp, per_node_damping, support_mask)
     return (d, tr2) if return_trace else d
 
 
-def _lk_fp32(h, u, lam_rel, sigma, eps, max_disp, per_node_damping=False):
+def masked_mean(x, support, dims=(-2, -1), keepdim=True):
+    """Support-weighted mean; an empty support has mean zero."""
+    support = support.to(x.dtype).expand_as(x)
+    return (x * support).sum(dims, keepdim=keepdim) / support.sum(dims, keepdim=keepdim).clamp_min(1e-6)
+
+
+def lk_support(support):
+    """One-pixel erosion, treating the exterior of the observed box as invalid."""
+    shape = support.shape
+    valid = (support > .99).float().reshape(-1, 1, *shape[-2:])
+    invalid = torch.nn.functional.pad(1 - valid, (1, 1, 1, 1), value=1)
+    interior = 1 - torch.nn.functional.max_pool2d(invalid, 3, stride=1)
+    return support * interior.reshape(shape)
+
+
+def _lk_fp32(h, u, lam_rel, sigma, eps, max_disp, per_node_damping=False, support_mask=None):
     B, V, C, H, W = h.shape
     hf = h
     e = hf - u[:, None]
@@ -146,13 +164,21 @@ def _lk_fp32(h, u, lam_rel, sigma, eps, max_disp, per_node_damping=False):
     gy = 0.5 * (torch.roll(hf, -1, -2) - torch.roll(hf, 1, -2))
     terms = torch.stack([(gx * gx).sum(2), (gx * gy).sum(2), (gy * gy).sum(2),
                          (gx * e).sum(2), (gy * e).sum(2)], 2)               # [B,V,5,H,W]
+    if support_mask is not None:
+        support = lk_support(support_mask.to(h).expand(B, V, H, W))
+        terms = terms * support[:, :, None]
     k = _gauss5(sigma, h.device)
     t = torch.nn.functional.conv2d(torch.nn.functional.pad(terms.reshape(B * V * 5, 1, H, W), (2, 2, 2, 2),
                                                            mode="replicate"), k).reshape(B, V, 5, H, W)
+    if support_mask is not None:
+        mass = torch.nn.functional.conv2d(torch.nn.functional.pad(support.reshape(B * V, 1, H, W),
+                                                                 (2, 2, 2, 2), mode="replicate"), k)
+        t = t / mass.reshape(B, V, 1, H, W).clamp_min(1e-6)
     gxx, gxy, gyy, bx, by = t.unbind(2)
     tr2 = 0.5 * (gxx + gyy)
     dims = (2, 3) if per_node_damping else (1, 2, 3)
-    lam = lam_rel * (tr2 + tr2.mean(dims, keepdim=True)) + eps              # [B,V,H,W]
+    reference = tr2.mean(dims, keepdim=True) if support_mask is None else masked_mean(tr2, support, dims)
+    lam = lam_rel * (tr2 + reference) + eps                               # [B,V,H,W]
     a, c = gxx + lam, gyy + lam
     det = (a * c - gxy * gxy).clamp_min(lam * lam)                            # PSD + lam I: det >= lam^2
     dx = (c * bx - gxy * by) / det

@@ -38,7 +38,7 @@ import torch.utils.checkpoint as ckpt
 from .cells import FloWMCell, KineticCell, AdaptiveNodeCell
 from .lock_nodes import LockState, features
 from .diagnostics import concentration_at, effective_count_at
-from .collision import (lattice_nodes, reflection_perms, bounce_back, rigid_bounce_back,
+from .collision import (lattice_nodes, named_nodes, reflection_perms, bounce_back, rigid_bounce_back,
                         known_wall_field, WallEncoder, VMixing, MLPCollision)
 from .transport import spectral_shift, stream
 from .gconv import GConvRegular, GConvInvariantOut, MomentProjection
@@ -64,13 +64,20 @@ class KineticWM(nn.Module):
                  bounce="rigid", rigid_K=28, rigid_eps=1e-3, rigid_eps_rel=0.05,
                  dec_input="flowm", beta_init=10.0, grad_ckpt=False,
                  n_digits=5, imprint_k=8, imprint_gamma=0.9,
-                 node_update_pred=True, readout_rel=False, node_update="lk", frozen_k=0, rot="none"):
+                 node_update_pred=True, readout_rel=False, node_update="lk", frozen_k=0, rot="none",
+                 lattice="grid", pin_static=None):
         super().__init__()
         if kind not in MODELS:
             raise ValueError(f"model must be one of {MODELS}")
         if collision not in COLLISIONS:
             raise ValueError(f"collision must be one of {COLLISIONS}")
         self.kind, self.C, self.world, self.window = kind, C, world, window
+        if lattice not in ("grid", "v5", "v9", "v17"):
+            raise ValueError(f"unknown lattice: {lattice!r}")
+        if lattice != "grid" and kind in ("flowm", "oracle"):
+            raise ValueError("named lattices require spectral or adaptive models")
+        self.lattice = lattice
+        self.pin_static = lattice != "grid" if pin_static is None else pin_static
         self.rot = rot
         if rot == "c4" and collision != "none":
             raise ValueError("c4 currently requires --collision none")
@@ -105,7 +112,7 @@ class KineticWM(nn.Module):
                     raise ValueError("the oracle diagnostic has no collision operator")
                 V = n_digits + 1
             else:
-                nodes = lattice_nodes(node_spacing, vmax)
+                nodes = lattice_nodes(node_spacing, vmax) if lattice == "grid" else named_nodes(lattice)
                 self.register_buffer("fixed_nodes", nodes)
                 px, py = reflection_perms(nodes)
                 self.register_buffer("perm_x", px)
@@ -115,7 +122,8 @@ class KineticWM(nn.Module):
                 if collision not in ("none", "bounce"):
                     raise ValueError("adaptive supports --collision none or bounce")
                 self.cell = AdaptiveNodeCell(in_ch, C, world, window, num_v=V, spacing=node_spacing,
-                                             imprint_k=imprint_k, gamma=imprint_gamma, node_update=node_update, rot=rot)
+                                             imprint_k=imprint_k, gamma=imprint_gamma, node_update=node_update, rot=rot,
+                                             pin_static=self.pin_static)
                 self.state_extra = self.cell.extra + self.cell.K_imp if node_update == "lk" else 0
             else:
                 self.cell = KineticCell(in_ch, C, world, window, num_v=V, rot=rot)
@@ -430,6 +438,7 @@ def build_model(args):
     g = (lambda k, d=None: args.get(k, d)) if isinstance(args, dict) else (lambda k, d=None: getattr(args, k, d))
     return KineticWM(kind=g("model"), C=g("C", 32), world=g("world", 50), window=g("window", 32),
                      node_spacing=g("node_spacing", 1.0), readout=g("readout", None),
+                     lattice=g("lattice", "grid"), pin_static=g("pin_static", None),
                      collision=g("collision", "none"),
                      wall_mode=g("wall_mode", "known"), bounce_mode=g("bounce_mode", "directional"),
                      wall_band=g("wall_band", 3), dec_input=g("dec_input", "flowm"),

@@ -43,6 +43,8 @@ for the corrected LK checkpoint backward pass with prediction updates off;
 see [PR6: C4 rotation](docs/PR6_c4_rotation.md) for evidence and the precise exception.
 Internal control: `--rot none_c4num` keeps untied layers with the three C4 numerical changes.
 
+See [K3D primitives](docs/K3D_primitives.md) for named node sets, scalar C4 convolution, and masked box measurements.
+
 ## Main result
 
 Mean squared error of the predicted viewport on 300 validation sequences with

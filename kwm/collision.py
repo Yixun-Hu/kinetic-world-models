@@ -23,6 +23,25 @@ def lattice_nodes(spacing=1.0, vmax=2.0):
     return torch.stack(torch.meshgrid(g, g, indexing="ij"), -1).reshape(-1, 2)  # [(2n+1)^2, 2]
 
 
+def named_nodes(name):
+    """C4/reflection-closed xy velocities, with the static node first.
+
+    v17 lists four counterclockwise (y-up) orbits after zero; v9 uses
+    vx-major order after zero; v5 follows FloWM-3D's axial order.
+    """
+    if name == "v17":
+        points = [(0., 0.)]
+        for x, y in ((.25, .25), (.75, .75), (.25, .75), (.75, .25)):
+            points.extend(((x, y), (-y, x), (-x, -y), (y, -x)))
+    elif name == "v9":
+        points = [(0., 0.)] + [(x, y) for x in (-1., 0., 1.) for y in (-1., 0., 1.) if x or y]
+    elif name == "v5":
+        points = [(0., 0.), (1., 0.), (0., 1.), (-1., 0.), (0., -1.)]
+    else:
+        raise ValueError(f"unknown node set: {name!r}")
+    return torch.tensor(points, dtype=torch.float32)
+
+
 def reflection_perms(nodes, tol=1e-4):
     """perm_x[i] = index of R_x nodes[i] = (-vx, vy); perm_y likewise. Asserts closure."""
     out = []

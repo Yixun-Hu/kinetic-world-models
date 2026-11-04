@@ -6,6 +6,41 @@ from torch import nn
 from torch.nn import functional as F
 
 
+class C4SymmetricDepthwise(nn.Module):
+    """Circular scalar-field convolution with centre/edge/corner weights.
+
+    The three parameters per channel expand to a C4-invariant 3x3 kernel;
+    channels are independent scalar fields, not orientation channels.
+    """
+    def __init__(self, channels, init="identity"):
+        super().__init__()
+        if channels <= 0 or init != "identity":
+            raise ValueError("channels must be positive and init must be 'identity'")
+        self.channels = channels
+        self.weight = nn.Parameter(torch.zeros(channels, 3))
+        with torch.no_grad():
+            self.weight[:, 0] = 1
+
+    def kernel(self):
+        center, edge, corner = self.weight.unbind(1)
+        return torch.stack((corner, edge, corner, edge, center, edge, corner, edge, corner), -1).reshape(-1, 1, 3, 3)
+
+    def forward(self, x):
+        return F.conv2d(F.pad(x, (1, 1, 1, 1), mode="circular"), self.kernel(), groups=self.channels)
+
+    @classmethod
+    def from_free_kernel(cls, weight):
+        """Project [C,3,3] onto C4 invariants by averaging each spatial orbit."""
+        if weight.ndim != 3 or weight.shape[-2:] != (3, 3):
+            raise ValueError("weight must have shape [C,3,3]")
+        layer = cls(weight.shape[0]).to(device=weight.device, dtype=weight.dtype)
+        with torch.no_grad():
+            layer.weight[:, 0] = weight[:, 1, 1]
+            layer.weight[:, 1] = weight[:, (0, 1, 2, 1), (1, 2, 1, 0)].mean(-1)
+            layer.weight[:, 2] = weight[:, (0, 0, 2, 2), (0, 2, 2, 0)].mean(-1)
+        return layer
+
+
 class _GConv(nn.Module):
     def convolve(self, x, weight):
         pad = weight.shape[-1] // 2
