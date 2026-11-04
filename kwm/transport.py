@@ -119,7 +119,7 @@ def _gauss5(sigma=1.0, device="cpu"):
 
 
 def lk_displacement(h, u, lam_rel=1e-2, sigma=1.0, eps=1e-3, max_disp=1.0, return_trace=False,
-                    *, per_node_damping=False, support_mask=None):
+                    *, per_node_damping=False, support_mask=None, support_weight=None, spatial_gradients=None):
     """One-step Lucas-Kanade estimate of the extra per-step displacement of transported content.
 
     h: [B, V, C, h, w] transported maps on the observed window (the adaptive-node model uses its observation
@@ -135,9 +135,14 @@ def lk_displacement(h, u, lam_rel=1e-2, sigma=1.0, eps=1e-3, max_disp=1.0, retur
     Optional support_mask broadcasts to [B,V,H,W]. Its one-pixel erosion
     excludes central differences across any unobserved boundary (including
     the box edge); Gaussian terms and damping means use only that support.
+    Optional support_weight multiplies this support *after* geometric erosion,
+    so soft change weights do not become holes in the derivative stencil.
+    spatial_gradients=(gx,gy) may supply derivatives of the transported Fourier
+    interpolant; otherwise the established central differences are unchanged.
     """
     with torch.autocast(device_type=h.device.type, enabled=False):
-        d, tr2 = _lk_fp32(h.float(), u.float(), lam_rel, sigma, eps, max_disp, per_node_damping, support_mask)
+        d, tr2 = _lk_fp32(h.float(), u.float(), lam_rel, sigma, eps, max_disp, per_node_damping, support_mask,
+                         support_weight, spatial_gradients)
     return (d, tr2) if return_trace else d
 
 
@@ -156,16 +161,22 @@ def lk_support(support):
     return support * interior.reshape(shape)
 
 
-def _lk_fp32(h, u, lam_rel, sigma, eps, max_disp, per_node_damping=False, support_mask=None):
+def _lk_fp32(h, u, lam_rel, sigma, eps, max_disp, per_node_damping=False, support_mask=None,
+             support_weight=None, spatial_gradients=None):
     B, V, C, H, W = h.shape
     hf = h
     e = hf - u[:, None]
-    gx = 0.5 * (torch.roll(hf, -1, -1) - torch.roll(hf, 1, -1))
-    gy = 0.5 * (torch.roll(hf, -1, -2) - torch.roll(hf, 1, -2))
+    if spatial_gradients is None:
+        gx = 0.5 * (torch.roll(hf, -1, -1) - torch.roll(hf, 1, -1))
+        gy = 0.5 * (torch.roll(hf, -1, -2) - torch.roll(hf, 1, -2))
+    else:
+        gx, gy = spatial_gradients
     terms = torch.stack([(gx * gx).sum(2), (gx * gy).sum(2), (gy * gy).sum(2),
                          (gx * e).sum(2), (gy * e).sum(2)], 2)               # [B,V,5,H,W]
     if support_mask is not None:
         support = lk_support(support_mask.to(h).expand(B, V, H, W))
+        if support_weight is not None:
+            support = support * support_weight
         terms = terms * support[:, :, None]
     k = _gauss5(sigma, h.device)
     t = torch.nn.functional.conv2d(torch.nn.functional.pad(terms.reshape(B * V * 5, 1, H, W), (2, 2, 2, 2),

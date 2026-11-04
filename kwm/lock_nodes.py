@@ -90,6 +90,31 @@ def gaussian(x, sigma=2.0, radius=6):
     return z.reshape(shape)
 
 
+@lru_cache(maxsize=16)
+@torch.no_grad()
+def _periodic_derivative_matrix(n, device, dtype):
+    """Real Fourier differentiation matrix; the even-grid Nyquist slope is zero."""
+    index = torch.arange(n, device=device)
+    d = index[:, None] - index[None]
+    angle = d.double() * (math.pi / n)
+    denominator = angle.sin() if n % 2 else angle.tan()
+    denominator = denominator.masked_fill(d == 0, 1)
+    matrix = (math.pi / n) * torch.where(d % 2 == 0, 1, -1) / denominator
+    return matrix.masked_fill(d == 0, 0).to(dtype)
+
+
+def _periodic_gradients(x):
+    """Differentiate the transported Fourier interpolant without another FFT.
+
+    The three-point LK stencil underestimates slopes of one-cell-wide blobs.
+    Apply the exact periodic derivative as two spatial matrix products on the
+    full transported world, before cropping the observed box.
+    """
+    dx = _periodic_derivative_matrix(x.shape[-1], x.device, x.dtype)
+    dy = _periodic_derivative_matrix(x.shape[-2], x.device, x.dtype)
+    return x @ dx.T, dy @ x
+
+
 def coherence(m, current, trace, displacement, support=None, lag=1, tr_rel=0.1, gate=0.6, coh_rel=0.5,
               *, mean_support=None):
     """KWM's mass, texture, residual-size and *unwarped* agreement gates."""
@@ -237,16 +262,18 @@ class LocalSearch:
             self.shifted_norm = self.shifted.square().sum(2)
 
     @torch.no_grad()
-    def __call__(self, transported, support):
+    def __call__(self, transported, support, *, support_weight=None):
         with torch.autocast(device_type=transported.device.type, enabled=False):
-            return self.search(transported.float(), support.float())
+            return self.search(transported.float(), support.float(), support_weight)
 
-    def search(self, transported, support):
+    def search(self, transported, support, support_weight=None):
         costs = []
         transported_norm = transported.square().sum(2)
         for start in range(0, self.count, self.chunk):
             stop = min(start + self.chunk, self.count)
             valid = support[:, :, None] * self.mask[:, :, start:stop]
+            if support_weight is not None:
+                valid = valid * support_weight[:, :, None]
             shifted = self.shifted[:, start:stop]
             # Contract channels directly: never allocate B,V,candidate,C,H,W.
             if self.c4:
@@ -287,7 +314,8 @@ class LocalSearch:
 
 def lock_measurement(previous, current, nu, lattice, action, world, dt=1.0,
                      lam_rel=1e-2, tr_rel=0.1, gate=0.6, coh_rel=0.5, bound=0.75, *, c4=False,
-                     box=None, support_mask=None, sigma=2.0, radius=6, static_residual=False):
+                     box=None, support_mask=None, sigma=2.0, radius=6, static_residual=False,
+                     residual_rel=0.1, return_diagnostics=False):
     """Return residual, evidence, and the freshly evaluated lock bit.
 
     LK retains its displacement derivative at locked nodes. Search, all gates,
@@ -298,13 +326,25 @@ def lock_measurement(previous, current, nu, lattice, action, world, dt=1.0,
     torus. Optional boolean support_mask excludes unobserved pixels; masked
     LK erodes transported overlap by one pixel before taking differences.
     sigma/radius control SSD aggregation, not the fixed +/-1 candidate grid.
-    static_residual subtracts the ego-only transported previous snapshot from
-    both images and excludes node zero (which must be the static lattice node).
+    static_residual=False preserves plain matching. "subtract" (also True)
+    subtracts ego-only transport from both images. "mask" matches plain images
+    weighted by channel-summed squared change: discard values <= residual_rel
+    times its masked maximum, divide by its masked mean, then clip to [0,1].
+    Both modes exclude static lattice node zero. residual_rel defaults to 0.1.
+    return_diagnostics appends detached evidence_before_modes [B,V], estimate
+    [B,V,2] (velocity), locked [B,V], and residual_weight [B,Hb,Wb] when active.
     """
+    if static_residual is True:
+        static_residual = "subtract"
+    if static_residual is not False and static_residual not in ("subtract", "mask"):
+        raise ValueError('static_residual must be False, True, "subtract", or "mask"')
+    if not 0 <= residual_rel <= 1:
+        raise ValueError("residual_rel must be in [0,1]")
     if box is not None or support_mask is not None or static_residual or not isinstance(world, int):
         return _lock_box(previous, current, nu, lattice, action, world, dt, lam_rel, tr_rel, gate, coh_rel,
                          bound, c4=c4, box=box, support_mask=support_mask, sigma=sigma, radius=radius,
-                         static_residual=static_residual)
+                         static_residual=static_residual, residual_rel=residual_rel,
+                         return_diagnostics=return_diagnostics)
     if previous.shape[-2] != previous.shape[-1] or previous.shape != current.shape:
         raise ValueError("matching square snapshots required without box")
     with torch.autocast(device_type=current.device.type, enabled=False):
@@ -330,11 +370,23 @@ def lock_measurement(previous, current, nu, lattice, action, world, dt=1.0,
         differentiable = (selected[:, :, None] * lk).sum((-2, -1)) / evidence[..., None].clamp_min(1e-6)
         differentiable = torch.where(locked[..., None], differentiable, 0)
         delta = delta + (differentiable - differentiable.detach())
-        return delta, evidence, locked.float()
+        result = delta, evidence, locked.float()
+        if return_diagnostics:
+            return (*result, _lock_diagnostics(weight, nu, delta, dt, locked))
+        return result
+
+
+@torch.no_grad()
+def _lock_diagnostics(weight, nu, delta, dt, locked, residual_weight=None):
+    diagnostics = dict(evidence_before_modes=weight.sum((-2, -1)),
+                       estimate=(nu + delta / dt).detach(), locked=locked.float())
+    if residual_weight is not None:
+        diagnostics["residual_weight"] = residual_weight.detach()
+    return diagnostics
 
 
 def _lock_box(previous, current, nu, lattice, action, world, dt, lam_rel, tr_rel, gate, coh_rel, bound,
-              *, c4, box, support_mask, sigma, radius, static_residual):
+              *, c4, box, support_mask, sigma, radius, static_residual, residual_rel, return_diagnostics):
     """Opt-in geometry/masking path; the legacy estimator above is unchanged."""
     if previous.shape != current.shape or previous.ndim != 4:
         raise ValueError("snapshots must have matching [B,K,Hb,Wb] shapes")
@@ -354,45 +406,82 @@ def _lock_box(previous, current, nu, lattice, action, world, dt, lam_rel, tr_rel
         shift = nu * dt - action.float()[:, None]
         # Append the ego-only phase to the same FFT bank, independently of rho_0.
         shifts = torch.cat([shift, -action.float()[:, None]], 1) if static_residual else shift
-        transported = crop_box(shift_snapshot(previous, shifts, world, c4=c4, box=box), shape, box)
+        full_transport = shift_snapshot(previous, shifts, world, c4=c4, box=box)
+        transported = crop_box(full_transport, shape, box)
         with torch.no_grad():
             support = shifted_window_mask(shifts, world, shape, box=box, support_mask=support_mask) * support_mask
+        residual_weight = None
         if static_residual:
             m0 = transported[:, -1]
-            m, current = transported[:, :-1] - m0[:, None], current - m0
+            m = transported[:, :-1]
+            change = current - m0
+            ego_support = support[:, -1]
             support = support[:, :-1] * support[:, -1:]
+            with torch.no_grad():
+                floor = 32 * torch.finfo(torch.float32).eps * m0.norm(dim=1).amax((-2, -1), keepdim=True)
+                signal = change.norm(dim=1) > floor
+                if static_residual == "mask":
+                    energy = change.square().sum(1)
+                    valid = ego_support  # common observed overlap
+                    maximum = (energy * (valid > 0)).amax((-2, -1), keepdim=True)
+                    mean = masked_mean(energy, valid)
+                    residual_weight = (energy / mean.clamp_min(torch.finfo(energy.dtype).tiny)).clamp(0, 1)
+                    residual_weight *= signal & (energy > residual_rel * maximum) & (valid > 0)
+                else:
+                    residual_weight = signal.float() * support_mask
+            if static_residual == "subtract":
+                m, current = m - m0[:, None], change
         else:
             m = transported
+        lk_kw = {}
+        if static_residual == "mask":
+            gradients = tuple(crop_box(g, shape, box) for g in _periodic_gradients(full_transport[:, :-1]))
+            lk_kw = dict(support_weight=residual_weight[:, None], spatial_gradients=gradients)
         lk, trace = lk_displacement(m, current, lam_rel, return_trace=True, per_node_damping=True,
-                                    support_mask=support)
+                                    support_mask=support, **lk_kw)
         with torch.no_grad():
             support = lk_support(support)
+            search_support = support
             if static_residual:
                 # A perfectly static target is zero up to FFT roundoff. Require
                 # actual current residual signal, so numerical dust cannot turn
                 # a background-only pair into moving evidence.
-                floor = 32 * torch.finfo(torch.float32).eps * m0.norm(dim=1).amax((-2, -1), keepdim=True)
-                support = support * (current.norm(dim=1) > floor)[:, None]
+                support = support * residual_weight[:, None]
                 support[:, 0] = 0
             lw = coherence(m, current, trace, lk, support, dt, tr_rel, gate, coh_rel, mean_support=support)
             ld, le = pool(lk, lw)
             textured = m.norm(dim=2) * (trace > tr_rel * masked_mean(trace, support)) * support
             agreement = le / textured.sum((-2, -1)).clamp_min(1e-6)
             locked = (agreement >= 0.1) & ((ld / dt).norm(dim=-1) <= 0.3)
+            search_kw = {"support_weight": residual_weight[:, None]} if static_residual == "mask" else {}
             d, usable = LocalSearch(current, world, c4=c4, box=box, support_mask=support_mask,
-                                     sigma=sigma, gaussian_radius=radius)(m, support)
+                                     sigma=sigma, gaussian_radius=radius)(
+                                         m, search_support if static_residual == "mask" else support, **search_kw)
+            if static_residual == "mask":
+                # A small LK step can be a false local minimum. Confirm it
+                # against the existing search, without changing gradient routing.
+                search_valid = support * usable
+                search_weight = coherence(m, current, trace, d, search_valid, dt, tr_rel, gate, coh_rel,
+                                          mean_support=support)
+                search_delta, search_evidence = pool(d, search_weight)
+                locked &= (search_evidence > 0) & ((ld - search_delta).norm(dim=-1) / dt <= 0.1)
             d = torch.where(locked[..., None, None, None], lk, d)
             usable = torch.where(locked[..., None, None], True, usable)
             valid = support * usable
-            weight = coherence(m, current, trace, d, valid, dt, tr_rel, gate, coh_rel, mean_support=valid)
+            reference_support = support if static_residual == "mask" else valid
+            weight = coherence(m, current, trace, d, valid, dt, tr_rel, gate, coh_rel,
+                               mean_support=reference_support)
             delta, evidence, selected = two_modes(d, weight, nu, lattice, dt, bound)
         differentiable = (selected[:, :, None] * lk).sum((-2, -1)) / evidence[..., None].clamp_min(1e-6)
         differentiable = torch.where(locked[..., None], differentiable, 0)
         delta = delta + (differentiable - differentiable.detach())
-        return delta, evidence, locked.float()
+        result = delta, evidence, locked.float()
+        if return_diagnostics:
+            return (*result, _lock_diagnostics(weight, nu, delta, dt, locked, residual_weight))
+        return result
 
 
 def measure_nodes(previous, current, nu, lattice, action, **kw):
-    """Thin velocity view of lock_measurement: (nu + delta/dt, evidence, lock)."""
-    delta, evidence, locked = lock_measurement(previous, current, nu, lattice, action, **kw)
-    return nu + delta / kw.get("dt", 1.0), evidence, locked
+    """Velocity view of lock_measurement, including optional diagnostics."""
+    delta, evidence, locked, *diagnostics = lock_measurement(previous, current, nu, lattice, action, **kw)
+    return (nu + delta / kw.get("dt", 1.0), evidence, locked, *diagnostics)

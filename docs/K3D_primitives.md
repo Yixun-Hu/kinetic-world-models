@@ -50,7 +50,7 @@ from kwm.lock_nodes import lock_measurement, measure_nodes
 velocity, evidence, locked = measure_nodes(
     previous, current, nu, lattice, action,
     world=33, dt=1.0, box=(7, 16), support_mask=cone,
-    sigma=1.0, radius=None, static_residual=True,
+    sigma=1.0, radius=None, static_residual="mask", residual_rel=0.1,
 )
 ```
 
@@ -60,7 +60,21 @@ top-left `(row,column)` on that torus, including seam-crossing boxes;
 `None` means origin placement. `action[B,2]` is camera displacement, so
 transport uses `nu*dt - action`. `lock_measurement` returns displacement
 residual `delta[B,V,2]`, evidence `[B,V]`, and fp32 lock bits `[B,V]`;
-`measure_nodes` only converts delta to `nu + delta/dt`.
+`measure_nodes` only converts delta to `nu + delta/dt` and passes all options
+through. Both functions normally return three tensors. Set
+`return_diagnostics=True` to append a detached dictionary:
+
+| Key | Shape | Meaning |
+| --- | --- | --- |
+| `evidence_before_modes` | `[B,V]` | Sum of pixel weights before reachable-cell filtering and the per-node two-mode selection. |
+| `estimate` | `[B,V,2]` | Final per-node velocity `nu + delta/dt`, including unevidenced nodes. |
+| `locked` | `[B,V]` | The freshly evaluated lock bit, equal to the normal return. |
+| `residual_weight` | `[B,Hb,Wb]` | Present for either residual mode: normalized change weight in `"mask"`; binary roundoff-floor gate in `"subtract"`. Zero outside observed support. |
+
+The normal `evidence` return is the selected-mode mass. Report both evidence
+arrays for **every node**, not only nodes assigned to known objects. A returned
+velocity without evidence is not a detection. Diagnostics never attach gradients
+or change the normal outputs.
 
 `support_mask=None`, `sigma=2.0`, `radius=6`, `static_residual=False`,
 `box=None`, and `c4=False` preserve the original square-window results
@@ -80,18 +94,52 @@ coherence scale, and LK trace/damping means use valid support per node.
 Search weights also intersect candidate validity. An empty support gives
 zero evidence. The legacy unmasked path retains its old border arithmetic.
 
-`static_residual=True` requires `lattice[0] == (0,0)` and measures
-`(m_i-m_0, current-m_0)`, where `m_0` uses ego motion only, regardless of
-`nu_0`. Node zero is excluded. A residual must exceed
-`32 * fp32_epsilon * max_pixels(norm_channels(m_0))` to carry evidence;
-this removes FFT roundoff in a background-only pair. This is a new,
-scale-relative numerical floor, not a learned motion threshold.
-The target background cancels when the observations match ego-only
-transport. For moving hypotheses, `m_i-m_0` can still contain shifted
-background texture; this residual construction is not a universal
-background decomposition or an accuracy guarantee for arbitrary scenes.
-Partial observations and fractional Fourier ringing can also leave
-residuals when new background enters the cone.
+### Residual modes
+
+`static_residual=False` remains the default. `"subtract"` is the existing
+`True` behavior, with identical outputs and gradients; `True` remains an alias.
+It matches `(m_i-m_0, current-m_0)`. This is a dipole-versus-dipole match with
+false minima: moving hypotheses retain shifted background texture, and even
+the blob alone can support incorrect nodes.
+
+`"mask"` uses ego-only transport `m_0` to find change, and matches the **plain
+pair `(m_i, current)`**. Let `s(x)` be the overlap of the current cone and
+bilinearly transported ego-only cone. For each batch item, define
+
+```text
+q(x) = sum_K (current(x) - m_0(x))²
+mu   = sum_x s(x) q(x) / sum_x s(x)       # mean before thresholding
+qmax = max over pixels with s(x) > 0 of q(x)
+r(x) = clip(q(x) / mu, 0, 1) if q(x) > residual_rel * qmax, else 0
+```
+
+Outside overlap, or when the mean is zero, `r=0`. `residual_rel` defaults to
+**0.1 of the masked maximum squared change** and accepts `[0,1]`; the threshold
+is strict, so 1 disables evidence. The weight is detached and multiplies LK
+terms and their normalization mass after geometric erosion, coherence weights,
+and LocalSearch's SSD numerator **and validity mass**. Soft weights do not
+erode the geometry. Texture/coherence reference means use the change-weighted
+support consistently, including when some search candidates are unusable.
+
+Mask mode also needs two numerical safeguards to pass the narrow-blob tests.
+LK uses derivatives of the transported Fourier interpolant, computed on the
+full torus with cached real differentiation matrices and two spatial matrix
+products. This avoids the three-point stencil's underestimated narrow-blob
+slopes and adds **no forward or inverse FFT**. It still has the same 5×5 LK
+aggregation and geometric erosion; Fourier derivatives, like Fourier transport,
+are global and can be influenced by the zero-filled observation boundary.
+A candidate LK lock must also have positive search evidence and agree with
+the pooled search velocity to within 0.1 cells/step. This rejects false small
+LK steps. Only the selected, locked LK field receives gradients; search remains
+detached. These safeguards apply only to `"mask"`.
+
+Both modes require `lattice[0] == (0,0)`, use ego-only `m_0` regardless of
+`nu_0`, and give the static node zero evidence and zero lock bit. Both reject
+change norms at or below
+`32 * fp32_epsilon * max_pixels(norm_channels(m_0))`, suppressing FFT roundoff.
+Exactly ego-consistent synthetic backgrounds give exactly zero evidence.
+This is **not** a universal background null: newly visible scenery, observation
+noise, and fractional Fourier ringing can leave change on a static background.
 
 Each snapshot bank uses one forward FFT, including the extra ego-only
 phase; search shares one current-snapshot FFT. The bounded geometry cache
@@ -101,9 +149,49 @@ values. Constructing a masked search key copies mask values to CPU
 Gates, search, clustering, and selection stay detached; only selected,
 locked LK displacements receive estimator gradients, as before.
 
-Tests cover exact legacy parity, named-set construction and 2D smoke
-rollouts, static pinning, C4 actions, convolution, rectangular seam
-transport, masking and gradients, all three Gaussian widths, and static
-and ego-motion nulls. The synthetic one-cell textured blob at `(0.3,-0.6)`
-has velocity error below 0.1 cells/step; real 3D lift kill tests remain
-necessary before choosing this estimator for training.
+### Measured residual limits
+
+CPU fp32, the original 177-cell cone, v17, sigma 1, `radius=None`, default
+thresholds, velocity `(0.3,-0.6)`, zero ego motion. White noise uses seed 0
+and standard deviation 0.1 (10% of nominal blob amplitude). Smooth ×3 scales
+the texture about its 0.3 DC level. The two-blob case adds an equal blob
+offset by `(x,y)=(1,4)`, with velocity `(-0.5,0.2)`; its nearest tied node is
+chosen by the lattice's first-index rule.
+
+| Scene / object | Subtract error | Evidence | Lock | Mask error | Evidence | Lock |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Original smooth | 0.071999 | 1.374438 | 1 | 0.015018 | 8.621327 | 1 |
+| White noise 10% | 0.170003 | 0.000192912 | 0 | 0.068047 | 8.451999 | 1 |
+| Smooth ×3 | 0.122300 | 0.084734 | 0 | 0.008770 | 8.530289 | 1 |
+| Two blobs: `(0.3,-0.6)` | 0.147460 | 0.931538 | 1 | 0.037016 | 8.538287 | 1 |
+| Two blobs: `(-0.5,0.2)` | 0.398040 | 0.851451 | 1 | 0.056064 | 2.917668 | 0 |
+
+**F4 correction:** the previous “blob error below 0.1” claim held only for
+the nearest node. On the original subtract scene, 13 of 16 moving nodes have
+evidence above `1e-6` (15 are strictly positive, including numerical dust).
+Node `(-0.75,-0.75)` estimates `(-1.135,-0.542)` with evidence 0.362, and
+`(-0.25,-0.75)` receives 0.882 versus the nearest node's 1.374. The white-noise
+evidence previously printed as 0.000 is small but nonzero at full precision.
+
+Mask mode's nearest node has the largest evidence on all three single-blob
+scenes. Among nodes farther than 0.5 cells/step from truth, the largest
+evidence / nearest-node evidence ratios are **0.2168, 0.2267, 0.2150**
+(original, noise, ×3); subtract gives **0.6420, 34.1779, 2.2347**. The mask
+limits also hold before two-mode selection and with ego motion `(1,0)`.
+Some wrong nodes still have evidence; mask mode does not claim unique detection.
+Both true nodes in the two-blob case are evidenced within 0.1; the second uses
+search and is **not locked**. Before selection, the first mask node has mass
+10.369458, reduced to 8.538287 by the per-node split.
+
+Stronger texture remains a failure: at 30% white noise, mask error is 0.3420,
+evidence 0.8988, unlocked; at 100%, its nearest-node evidence is zero. Subtract
+has errors 0.1581 with evidence about `1.8e-14` and zero, respectively, both
+unlocked. These are synthetic gates, not evidence of real 3D lift accuracy
+or training benefit. Search validity mass also depends on Gaussian width;
+a sparse change region can be rejected at wider aggregation settings.
+
+`tests/test_lock_box.py -s` prints every node's estimate, both evidence values,
+and lock bit for each required scene in both modes. Tests also cover legacy
+bit parity, residual nulls, diagnostics, relative thresholding, gradient
+isolation, and exactly two shared forward/two inverse FFT calls per measurement.
+Full measurements and validation are recorded in `.k3d/FIXPASS2.md`.
