@@ -266,6 +266,9 @@ class AdaptiveNodeCell(_Base):
         state = torch.cat([h_new, fields.to(h_new.dtype), m_new.to(h_new.dtype)], 2)
         return (state, updated[1]) if return_prelift else state
 
+    def _measure_lock(self, *args, **kwargs):
+        return lock_measurement(*args, **kwargs)
+
     def _forward_lock(self, u_t, h_prev, action, nodes, dt, collision, update_nodes, return_prelift=False):
         if collision is not None:
             h_prev = collision(h_prev)
@@ -277,7 +280,7 @@ class AdaptiveNodeCell(_Base):
             u = self.conv_u(u_t)
             with torch.autocast(device_type=u_t.device.type, enabled=False):
                 pu = self.imprint(u.float())
-                delta, evidence, locked = lock_measurement(
+                delta, evidence, locked = self._measure_lock(
                     h_prev.snapshot, pu, nu, nodes, action, self.world, dt,
                     self.lam_rel, self.tr_rel, self.gate, self.coh_rel, self.bound, c4=self.c4_numerics)
                 evidence = self._pin(evidence, nodes)
