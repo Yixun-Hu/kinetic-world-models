@@ -231,7 +231,7 @@ class LocalSearch:
     """
     @torch.no_grad()
     def __init__(self, current, world, candidate_chunk=7, radius=1.0, *, c4=False,
-                 box=None, support_mask=None, sigma=2.0, gaussian_radius=6):
+                 box=None, support_mask=None, sigma=2.0, gaussian_radius=6, support_mask_key=None):
         win = current.shape[-1]
         self.current = current.float()
         self.chunk = candidate_chunk
@@ -252,7 +252,9 @@ class LocalSearch:
                 box = (0, 0) if box is None else tuple(box)
                 # The mask is fixed geometry. A value key avoids stale cached
                 # masks after an in-place edit, or aliases of equal-shaped cones.
-                mask_key = None if support_mask is None else tuple(support_mask.detach().cpu().flatten().tolist())
+                mask_key = support_mask_key
+                if mask_key is None and support_mask is not None:
+                    mask_key = tuple(support_mask.detach().cpu().flatten().tolist())
                 self.shifts, self.mask = _candidate_geometry(_world_shape(world), shape, radius,
                                                               current.device, box, mask_key)
                 if support_mask is not None:
@@ -315,8 +317,11 @@ class LocalSearch:
 def lock_measurement(previous, current, nu, lattice, action, world, dt=1.0,
                      lam_rel=1e-2, tr_rel=0.1, gate=0.6, coh_rel=0.5, bound=0.75, *, c4=False,
                      box=None, support_mask=None, sigma=2.0, radius=6, static_residual=False,
-                     residual_rel=0.1, return_diagnostics=False):
+                     residual_rel=0.1, return_diagnostics=False, support_mask_key=None):
     """Return residual, evidence, and the freshly evaluated lock bit.
+
+    support_mask_key may cache the flattened bool support as an immutable tuple;
+    callers must keep it consistent with support_mask throughout its lifetime.
 
     LK retains its displacement derivative at locked nodes. Search, all gates,
     clustering and mode selection are detached; the final weighted LK sum is
@@ -344,7 +349,7 @@ def lock_measurement(previous, current, nu, lattice, action, world, dt=1.0,
         return _lock_box(previous, current, nu, lattice, action, world, dt, lam_rel, tr_rel, gate, coh_rel,
                          bound, c4=c4, box=box, support_mask=support_mask, sigma=sigma, radius=radius,
                          static_residual=static_residual, residual_rel=residual_rel,
-                         return_diagnostics=return_diagnostics)
+                         return_diagnostics=return_diagnostics, support_mask_key=support_mask_key)
     if previous.shape[-2] != previous.shape[-1] or previous.shape != current.shape:
         raise ValueError("matching square snapshots required without box")
     with torch.autocast(device_type=current.device.type, enabled=False):
@@ -386,7 +391,7 @@ def _lock_diagnostics(weight, nu, delta, dt, locked, residual_weight=None):
 
 
 def _lock_box(previous, current, nu, lattice, action, world, dt, lam_rel, tr_rel, gate, coh_rel, bound,
-              *, c4, box, support_mask, sigma, radius, static_residual, residual_rel, return_diagnostics):
+              *, c4, box, support_mask, sigma, radius, static_residual, residual_rel, return_diagnostics, support_mask_key=None):
     """Opt-in geometry/masking path; the legacy estimator above is unchanged."""
     if previous.shape != current.shape or previous.ndim != 4:
         raise ValueError("snapshots must have matching [B,K,Hb,Wb] shapes")
@@ -455,7 +460,7 @@ def _lock_box(previous, current, nu, lattice, action, world, dt, lam_rel, tr_rel
             locked = (agreement >= 0.1) & ((ld / dt).norm(dim=-1) <= 0.3)
             search_kw = {"support_weight": residual_weight[:, None]} if static_residual == "mask" else {}
             d, usable = LocalSearch(current, world, c4=c4, box=box, support_mask=support_mask,
-                                     sigma=sigma, gaussian_radius=radius)(
+                                     sigma=sigma, gaussian_radius=radius, support_mask_key=support_mask_key)(
                                          m, search_support if static_residual == "mask" else support, **search_kw)
             if static_residual == "mask":
                 # A small LK step can be a false local minimum. Confirm it
