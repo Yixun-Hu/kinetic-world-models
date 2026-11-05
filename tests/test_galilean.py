@@ -90,6 +90,18 @@ def test_memory_equivariance_eval_runs():
     assert out["comoving_off"]["t6"][0] > 10 * out["comoving_on"]["t6"][0]
 
 
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_memory_equivariance_comoving_on_lattice_lock(seed):
+    from kwm.eval import equiv_memory
+    torch.manual_seed(seed)
+    args = dict(model="adaptive", C=4, node_spacing=1.0, node_update="lock")
+    model = build_model(args).eval()
+    out = equiv_memory(model, args, EnvConfig(real_velocity=True, real_camera=True),
+                       2, "cpu", ts=(3, 6), chunk=2)
+    for time in (3, 6):
+        assert out["comoving_on"][f"t{time}"][0] < 1e-5
+
+
 def test_output_equivariance():
     """Output-level equivariance is not exactly zero on the lattice, even untrained: (i) the finite velocity lattice -- the boosted
     run's edge channels receive content the unboosted run's lattice cannot hold, and the max / moment readouts pool

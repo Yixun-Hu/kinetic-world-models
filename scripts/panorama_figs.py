@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from kwm.env import make_batch, _fourier_shift
 from kwm.env import EnvConfig
 from kwm.eval import load_model, node_velocity_error
+from kwm.lock_nodes import features
 from kwm.train import ROOT, VAL_SEED, VAL_T_PRED, val_cache
 
 MODELS = [  # (key, label, run, ckpt)
@@ -60,16 +61,15 @@ def find_reentry(vis, T_obs):
 def run_model(model, fr, an, T_obs, T_pred):
     """Re-implements KineticWM._forward (no walls, no collision) recording the memory map and the adaptive nodes.
     Returns preds [B,T_pred,1,win,win], mem [B,T,W,W] (ego frame), nodes [B,T_obs,V,2] or None."""
-    B = fr.shape[0]
-    h = fr.new_zeros(B, model.num_v, model.C + model.state_extra, model.world, model.world)
+    h = model.initial_state(fr[:, 0])
     mems, nodes, preds = [], [], []
     adaptive = model.kind == "adaptive"
-    feat = lambda h: h[:, :, :model.C].float().norm(dim=2).amax(1)
+    feat = lambda h: features(h)[:, :, :model.C].float().norm(dim=2).amax(1)
     for t in range(T_obs):
         h, _ = model.step(fr[:, t], h, an[:, t], 1.0, None)
         mems.append(feat(h))
         if adaptive:
-            nodes.append(model.cell.last_nodes.float())
+            nodes.append(model.nodes()[None].float() + model.cell.offsets(h))
     if adaptive and not model.node_update_pred:
         model.cell.update_nodes = False
     prev = fr[:, T_obs - 1]
