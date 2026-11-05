@@ -309,8 +309,10 @@ def main(argv=None):
     kinetic = args["model"] != "flowm"
     res = dict(run=name, ckpt=a.ckpt, step=step, model=args["model"], params=count_params(model),
                num_v=model.num_v, env=cfg.to_dict(), n_val=n_val, tag=a.tag,
-               node_update=model.node_update, node_update_pred=getattr(model, "node_update_pred", None),
+               node_update_pred=getattr(model, "node_update_pred", None),
                readout_rel=getattr(model, "readout_rel", None))
+    if model.kind == "adaptive":
+        res["node_update"] = model.node_update
 
     # ---------------- adaptive: node velocity error at the end of the observation ----------------
     if args["model"] == "adaptive" and not cfg.walls:

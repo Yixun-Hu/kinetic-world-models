@@ -1,6 +1,6 @@
 """CPU acceptance tests for the opt-in snapshot lock estimator.
 
-Run with OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1. The two dataset cases
+Run with OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=6. The two dataset cases
 use 12-sequence prefixes and require -m slow or KWM_SLOW=1.
 """
 import importlib.util
@@ -141,12 +141,45 @@ def test_eval_node_update_override(tmp_path, saved_mode):
             assert torch.equal(value, loaded.state_dict()[name])
 
 
+@pytest.mark.parametrize('kind', ['flowm', 'spectral', 'oracle'])
+def test_nonadaptive_rejects_lock(tmp_path, kind):
+    from kwm.eval import load_model
+    args = dict(model=kind, C=2, world=16, window=8)
+    with pytest.raises(ValueError, match="requires model='adaptive'"):
+        build_model(dict(args, node_update='lock'))
+    model = build_model(args)
+    torch.save(dict(args=args, model=model.state_dict(), step=7), tmp_path / 'best.pt')
+    with pytest.raises(ValueError, match="requires model='adaptive'"):
+        load_model(tmp_path, 'best', 'cpu', node_update='lock')
+
+
+@pytest.mark.parametrize('kind', ['adaptive', 'flowm', 'spectral', 'oracle'])
+def test_eval_records_node_rule_only_for_adaptive(tmp_path, monkeypatch, kind):
+    import json
+    import kwm.eval as evaluation
+    args = vars(parse_args(['--model', kind, '--C', '2', '--world', '16', '--window', '8']))
+    model = build_model(args)
+    torch.save(dict(args=args, model=model.state_dict(), step=7), tmp_path / 'best.pt')
+    # Exercise the real metadata writer without a rollout or validation-cache writes.
+    monkeypatch.setattr(evaluation, 'val_cache', lambda *a, **kw: {})
+    monkeypatch.setattr(evaluation, 'equiv_output', lambda *a, **kw: {})
+    monkeypatch.setattr(evaluation, 'node_velocity_error',
+                        lambda *a, **kw: dict(median=0., mean=0., n=0))
+    out = tmp_path / 'eval'
+    evaluation.main(['--run', str(tmp_path), '--out', str(out), '--device', 'cpu',
+                     '--only_equiv', '--equiv_boost_output'])
+    result = json.loads((out / 'eval.json').read_text())
+    if kind == 'adaptive':
+        assert result['node_update'] == 'lk'
+    else:
+        assert 'node_update' not in result
+
+
 def _assignment(cost):
     """Small rectangular Hungarian assignment, with rows <= columns.
 
     CPU-only metric helper: successive shortest augmenting paths with row and
-    column potentials. Assign all digits before filtering visibility, exactly
-    as in the gate, without importing the gate or its optional dependencies.
+    column potentials. Assign all digits before filtering visibility.
     """
     costs = cost.tolist()
     n, m = cost.shape
@@ -219,8 +252,7 @@ def _dataset_run(seed, size, n):
     (777, 100, 0.023351069539785385, 0.18333333730697632),
 ])
 def test_accuracy_final_rule(seed, size, median, miss):
-    # Frozen final-rule gate values for the first 12 sequences of each draw;
-    # full 100-sequence results and the prefix protocol are documented.
+    # Frozen final-rule values for the first 12 sequences of each full draw.
     result = _dataset_run(seed, size, 12)
     print(f'seed-{seed} accuracy: {result}')
     assert result['matched_median'] <= 1.1 * median
@@ -336,6 +368,57 @@ def test_bf16_state_and_search():
     assert state.features.dtype == torch.bfloat16
     state.features.float().square().mean().backward()
     assert cell.n_s.grad is not None and torch.isfinite(cell.n_s.grad)
+
+
+@pytest.mark.parametrize('velocity', [(.5, 0.), (-.5, .3)])
+def test_unlocked_translation_sign_and_magnitude(velocity):
+    previous = _blob(32, 16, 16)[None, None].expand(1, 8, 32, 32).clone()
+    expected = torch.tensor(velocity)
+    current = spectral_shift(previous, expected[None])
+    nu = torch.zeros(1, 1, 2)
+    delta, evidence, locked = lock_measurement(previous, current, nu, nu[0], torch.zeros(1, 2), 32)
+    assert locked.item() == 0 and evidence.item() > 0
+    assert (delta[0, 0] - expected).norm() <= .1
+
+
+@pytest.mark.parametrize('split', [False, True])
+def test_detached_forward_and_locked_lk_gradient(monkeypatch, split):
+    import kwm.lock_nodes as lock
+    # Control the LK field to exercise both mode branches, with one locked
+    # node and one searched node; the SSD search itself remains real.
+    previous = _blob(32, 16, 16)[None, None]
+    current = spectral_shift(previous, torch.tensor([[.5, 0.]]))
+    field = torch.zeros(1, 2, 2, 32, 32)
+    field[:, 0, 0] = .2
+    if split:
+        field[:, 0, 0, :, :16], field[:, 0, 0, :, 16:] = -.1, .3
+    field[:, 1, 0] = .5
+    field.requires_grad_()
+    monkeypatch.setattr(lock, 'lk_displacement', lambda *a, **kw: (field, torch.ones(1, 2, 32, 32)))
+    detached = {}
+    original = lock.two_modes
+
+    def capture(*args):
+        result = original(*args)
+        detached['result'] = result
+        detached['weight'] = args[1]
+        return result
+
+    monkeypatch.setattr(lock, 'two_modes', capture)
+    nu = torch.zeros(1, 2, 2)
+    delta, evidence, locked = lock.lock_measurement(previous, current, nu, nu[0], torch.zeros(1, 2), 32)
+    expected, mass, selected = detached['result']
+    assert torch.equal(locked, torch.tensor([[1., 0.]]))
+    assert (evidence > 0).all()
+    assert not expected.requires_grad and not mass.requires_grad and not selected.requires_grad
+    assert torch.equal(delta, expected) and torch.equal(evidence, mass)
+    # Verify the controlled field really selected the intended mode branch.
+    total = detached['weight'][:, 0].sum()
+    assert (evidence[0, 0] < total).item() == split
+    gradient = torch.autograd.grad(delta.sum(), field)[0]
+    assert torch.count_nonzero(gradient[:, 0]) > 0
+    assert torch.count_nonzero(gradient[:, 1]) == 0
+    assert torch.count_nonzero(gradient * (selected == 0)[:, :, None]) == 0
 
 
 @pytest.mark.parametrize('velocity, expected_lock', [(.2, 1.), (.5, 0.)])

@@ -76,9 +76,6 @@ from a digit's velocity in the median.*
 
 ## Quick start
 
-`--model adaptive --node_update lock` enables lock-then-refine velocity updates;
-the default is `lk`. See [the method and evidence](docs/PR1_lock_nodes.md).
-
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
@@ -86,6 +83,8 @@ pytest -q
 python -m kwm.train --model adaptive --real_velocity --real_camera --steps 20000 --out runs/adaptive
 python -m kwm.eval --run runs/adaptive --n_val 300 --equiv_boost
 ```
+
+`--model adaptive --node_update lock` enables [lock-then-refine velocity updates](docs/LOCK_NODES.md), with `lk` remaining the default.
 
 `docs/REPRODUCE.md` lists the command for every table and figure.
 

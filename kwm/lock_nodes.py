@@ -1,7 +1,7 @@
 """Functional fp32 lock-then-refine estimator with per-node texture and damping.
 
 No estimator history lives here: the cell owns an explicit LockState value.
-See docs/PR1_lock_nodes.md for thresholds, state layout and gradient routing.
+See docs/LOCK_NODES.md for thresholds, state layout and gradient routing.
 """
 from functools import lru_cache
 from typing import NamedTuple

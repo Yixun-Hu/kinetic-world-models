@@ -113,7 +113,7 @@ class AdaptiveNodeCell(_Base):
     node_update='lock' uses LockState(features, nodes, snapshot), with compact
     fp32 nodes [B,V,4] (rho_x, rho_y, evidence, lock) and one fp32 observed
     snapshot [B,K,win,win] per sample. gamma affects only the LK imprint bank.
-    See lock_nodes.py and PR1_lock_nodes.md.
+    See lock_nodes.py and docs/LOCK_NODES.md.
     """
 
     extra = 3
@@ -187,7 +187,7 @@ class AdaptiveNodeCell(_Base):
         fields = st[..., None, None].expand(B, V, E, H, W).to(h.dtype)
         return torch.cat([content[:, :, :C], fields, content[:, :, C:]], 2)
 
-    def forward(self, u_t, h_prev, action, nodes, dt=1.0, collision=None, update_nodes=None):
+    def forward(self, u_t, h_prev, action, nodes, dt=1.0, collision=None, *, update_nodes=None):
         update_nodes = self.update_nodes if update_nodes is None else update_nodes
         if self.node_update == "lock":
             return self._forward_lock(u_t, h_prev, action, nodes, dt, collision, update_nodes)
@@ -245,9 +245,10 @@ class AdaptiveNodeCell(_Base):
                     self.lam_rel, self.tr_rel, self.gate, self.coh_rel, self.bound)
                 W_new = h_prev.nodes[..., 2:3] + evidence[..., None]
                 gain = evidence[..., None] / W_new.clamp_min(1e-6)
-                # Form the residual from the measured velocity in fp32.
+                # Keep fp32 rounding: delta / dt alone changes trained-model results.
                 residual = (nu + delta / dt) - nu
                 step = (self.n_s * gain * residual).clamp(-self.step_clip, self.step_clip)
+                # Likewise, nu - lattice is not bit-identical to the stored rho.
                 rho_new = (nu - nodes[None].float() + step).clamp(-self.bound, self.bound)
                 state = torch.cat([rho_new, W_new, locked[..., None]], -1)
         else:

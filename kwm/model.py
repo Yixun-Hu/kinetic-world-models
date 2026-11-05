@@ -62,6 +62,8 @@ class KineticWM(nn.Module):
         super().__init__()
         if kind not in MODELS:
             raise ValueError(f"model must be one of {MODELS}")
+        if node_update != "lk" and kind != "adaptive":
+            raise ValueError("node_update='lock' requires model='adaptive'")
         if collision not in COLLISIONS:
             raise ValueError(f"collision must be one of {COLLISIONS}")
         self.kind, self.C, self.world, self.window = kind, C, world, window
